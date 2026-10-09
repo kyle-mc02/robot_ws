@@ -1,0 +1,39 @@
+[0.838s] Invoking command in '/home/koil/robot_ws/src/motor_driver': DEBUGINFOD_URLS=https://debuginfod.ubuntu.com PYTHONPATH=/home/koil/robot_ws/build/motor_driver/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/koil/robot_ws/install/motor_driver/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/motor_driver build --build-base /home/koil/robot_ws/build/motor_driver/build install --record /home/koil/robot_ws/build/motor_driver/install.log --install-scripts $base/lib/motor_driver --single-version-externally-managed install_data
+[1.064s] running egg_info
+[1.064s] creating ../../build/motor_driver/motor_driver.egg-info
+[1.081s] writing ../../build/motor_driver/motor_driver.egg-info/PKG-INFO
+[1.082s] writing dependency_links to ../../build/motor_driver/motor_driver.egg-info/dependency_links.txt
+[1.082s] writing requirements to ../../build/motor_driver/motor_driver.egg-info/requires.txt
+[1.082s] writing top-level names to ../../build/motor_driver/motor_driver.egg-info/top_level.txt
+[1.082s] writing manifest file '../../build/motor_driver/motor_driver.egg-info/SOURCES.txt'
+[1.116s] reading manifest file '../../build/motor_driver/motor_driver.egg-info/SOURCES.txt'
+[1.116s] adding license file 'LICENSE'
+[1.116s] writing manifest file '../../build/motor_driver/motor_driver.egg-info/SOURCES.txt'
+[1.116s] running build
+[1.117s] running build_py
+[1.117s] creating /home/koil/robot_ws/build/motor_driver/build
+[1.117s] creating /home/koil/robot_ws/build/motor_driver/build/lib
+[1.117s] creating /home/koil/robot_ws/build/motor_driver/build/lib/motor_driver
+[1.117s] copying motor_driver/driver_node.py -> /home/koil/robot_ws/build/motor_driver/build/lib/motor_driver
+[1.117s] copying motor_driver/__init__.py -> /home/koil/robot_ws/build/motor_driver/build/lib/motor_driver
+[1.117s] copying motor_driver/motor_gui_node.py -> /home/koil/robot_ws/build/motor_driver/build/lib/motor_driver
+[1.117s] running install
+[1.122s] running install_lib
+[1.140s] creating /home/koil/robot_ws/install/motor_driver/lib/python3.12/site-packages/motor_driver
+[1.140s] copying /home/koil/robot_ws/build/motor_driver/build/lib/motor_driver/driver_node.py -> /home/koil/robot_ws/install/motor_driver/lib/python3.12/site-packages/motor_driver
+[1.140s] copying /home/koil/robot_ws/build/motor_driver/build/lib/motor_driver/__init__.py -> /home/koil/robot_ws/install/motor_driver/lib/python3.12/site-packages/motor_driver
+[1.140s] copying /home/koil/robot_ws/build/motor_driver/build/lib/motor_driver/motor_gui_node.py -> /home/koil/robot_ws/install/motor_driver/lib/python3.12/site-packages/motor_driver
+[1.140s] byte-compiling /home/koil/robot_ws/install/motor_driver/lib/python3.12/site-packages/motor_driver/driver_node.py to driver_node.cpython-312.pyc
+[1.141s] byte-compiling /home/koil/robot_ws/install/motor_driver/lib/python3.12/site-packages/motor_driver/__init__.py to __init__.cpython-312.pyc
+[1.141s] byte-compiling /home/koil/robot_ws/install/motor_driver/lib/python3.12/site-packages/motor_driver/motor_gui_node.py to motor_gui_node.cpython-312.pyc
+[1.142s] running install_data
+[1.142s] creating /home/koil/robot_ws/install/motor_driver/share/ament_index
+[1.142s] creating /home/koil/robot_ws/install/motor_driver/share/ament_index/resource_index
+[1.142s] creating /home/koil/robot_ws/install/motor_driver/share/ament_index/resource_index/packages
+[1.142s] copying resource/motor_driver -> /home/koil/robot_ws/install/motor_driver/share/ament_index/resource_index/packages
+[1.142s] copying package.xml -> /home/koil/robot_ws/install/motor_driver/share/motor_driver
+[1.142s] running install_egg_info
+[1.160s] Copying ../../build/motor_driver/motor_driver.egg-info to /home/koil/robot_ws/install/motor_driver/lib/python3.12/site-packages/motor_driver-0.0.0-py3.12.egg-info
+[1.161s] running install_scripts
+[1.270s] writing list of installed files to '/home/koil/robot_ws/build/motor_driver/install.log'
+[1.297s] Invoked command in '/home/koil/robot_ws/src/motor_driver' returned '0': DEBUGINFOD_URLS=https://debuginfod.ubuntu.com PYTHONPATH=/home/koil/robot_ws/build/motor_driver/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/koil/robot_ws/install/motor_driver/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/motor_driver build --build-base /home/koil/robot_ws/build/motor_driver/build install --record /home/koil/robot_ws/build/motor_driver/install.log --install-scripts $base/lib/motor_driver --single-version-externally-managed install_data

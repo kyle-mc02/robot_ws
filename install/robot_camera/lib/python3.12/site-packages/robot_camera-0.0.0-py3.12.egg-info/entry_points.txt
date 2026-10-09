@@ -1,0 +1,2 @@
+[console_scripts]
+basestation_gui = robot_camera.basestation_gui:main
