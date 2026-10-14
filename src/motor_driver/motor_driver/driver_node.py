@@ -19,8 +19,8 @@ class RobotDriver(Node):
 
     def listener_callback(self, msg):
         # Constrain values to the shield's limits to prevent integer overflow
-        left = max(-400, min(400, int(msg.x)))
-        right = max(-400, min(400, int(msg.y)))
+        left = max(-400, min(400, int(-msg.x)))
+        right = max(-400, min(400, int(-msg.y)))
         
         if self.serial_port and self.serial_port.is_open:
             # Pack format: '<Bhh' 
@@ -50,3 +50,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
