@@ -93,10 +93,8 @@ class MotorControlUI(QMainWindow):
         self.update_motors()
 
     def update_motors(self):
-        # PyQt sets minimum at the top and maximum at the bottom.
-        # Multiplying by -1 inverts this so pushing UP is positive (forward).
-        left_speed = -self.left_slider.value()
-        right_speed = -self.right_slider.value()
+        left_speed = self.left_slider.value()
+        right_speed = self.right_slider.value()
 
         self.left_label.setText(f"{left_speed}")
         self.right_label.setText(f"{right_speed}")
