@@ -15,12 +15,26 @@ class RobotDriver(Node):
             self.serial_port = None
 
         self.subscription = self.create_subscription(
-            Vector3, '/motor_cmds', self.listener_callback, 10)
-
+            Twist, '/motor_cmds', self.listener_callback, 10)
+    
+    # Expecting a vector with (Linear vel, Angular val, ___)
     def listener_callback(self, msg):
+        # Motor = 13.5 RPM = 27/2 * 2pi/60 : pi*9/20 
+        # Rated RMP = 6800 (max is 7000) = 6800 * 2pi/60 : rad/s (680/3*pi)
+        linVel = float(msg.linear.x)
+        angVel = float(msg.angular.z) 
+
+        eta = 504
+        Rwheel = 0.15/2 #in m
+        lwheels = 0.44  #in m
+        MAX = 6800
+        
+        wml = (eta/Rwheel) * (linVel - 0.5*lwheels*angVel)
+        wmr = (eta/Rwheel) * (linVel + 0.5*lwheels*angVel)
+        
         # Constrain values to the shield's limits to prevent integer overflow
-        left = max(-400, min(400, int(msg.x)))
-        right = max(-400, min(400, int(-msg.y)))
+        left = max(-340, min(340, int(wml / MAX)))
+        right = max(-340, min(340, int(-wmr / MAX)))
         
         if self.serial_port and self.serial_port.is_open:
             # Pack format: '<Bhh' 
