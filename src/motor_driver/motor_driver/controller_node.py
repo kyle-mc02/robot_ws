@@ -17,7 +17,7 @@ class JoyToCmdVel(Node):
         self.declare_parameter('wheel_radius', 0.075)       # meters
         self.declare_parameter('wheel_separation', 0.40)   # meters
         self.declare_parameter('gear_ratio', 504.0)         # motor / wheel speed
-        self.declare_parameter('max_motor_speed', 340.0)   # rad/s BEFORE gearbox
+        self.declare_parameter('max_motor_speed', 712.1)   # rad/s BEFORE gearbox
 
         # Axis indexes for joy's game_controller_node.
         self.declare_parameter('forward_axis', 1)  # Left stick vertical
