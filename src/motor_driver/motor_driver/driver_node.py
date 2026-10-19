@@ -15,7 +15,7 @@ class RobotDriver(Node):
             self.serial_port = None
 
         self.subscription = self.create_subscription(
-            Twist, '/motor_cmds', self.listener_callback, 10)
+            Twist, '/cmd_vel', self.listener_callback, 10)
     
     # Expecting a vector with (Linear vel, Angular val, ___)
     def listener_callback(self, msg):
