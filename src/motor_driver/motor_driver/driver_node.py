@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Vector3
+from geometry_msgs.msg import Twist
 import serial
 import struct
 
