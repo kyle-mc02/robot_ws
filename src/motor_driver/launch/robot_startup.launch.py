@@ -30,7 +30,7 @@ def generate_launch_description():
             launch_arguments={
                 'enable_gyro': 'true', 
                 'enable_accel': 'true',
-                'align_depth.enable': 'true'
+                'align_depth.enable': 'true',
                 'rgb_camera.color_profile': '640x480x15',
                 'depth_module.depth_profile': '640x480x15'
             }.items()
