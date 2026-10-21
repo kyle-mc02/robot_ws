@@ -5,7 +5,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from geometry_msgs.msg import Twist
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
 
 from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QGroupBox
@@ -22,12 +22,18 @@ class BasestationNode(Node):
         self.telemetry_signal = telemetry_signal
         self.bridge = CvBridge()
 
+        video_qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1
+        )
+
         # Subscribe to the compressed camera stream
         self.create_subscription(
             CompressedImage, 
             '/camera/camera/color/image_raw/compressed', 
             self.image_callback, 
-            qos_profile_sensor_data
+            video_qos
         )
         
         # Subscribe to cmd_vel
