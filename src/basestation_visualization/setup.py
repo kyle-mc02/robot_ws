@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'robot_camera'
+package_name = 'basestation_visualization'
 
 setup(
     name=package_name,
@@ -13,8 +13,8 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='koil',
-    maintainer_email='koil@todo.todo',
+    maintainer='victor',
+    maintainer_email='victor@todo.todo',
     description='TODO: Package description',
     license='TODO: License declaration',
     extras_require={
@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'basestation_gui = robot_camera.basestation_gui:main',
+            'gui_node = basestation_visualization.gui_node:main'
         ],
     },
 )
