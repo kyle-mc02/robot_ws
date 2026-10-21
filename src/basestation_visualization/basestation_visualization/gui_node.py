@@ -3,8 +3,9 @@
 import sys
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage
 from geometry_msgs.msg import Twist
+from rclpy.qos import qos_profile_sensor_data
 from cv_bridge import CvBridge
 
 from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QGroupBox
@@ -13,27 +14,29 @@ from PyQt5.QtCore import pyqtSignal, QThread, Qt
 import cv2
 import numpy as np
 
-# --- 1. ROS 2 Background Thread ---
-class ROS2Thread(QThread, Node):
-    # Signals to send data safely to the GUI thread
-    image_signal = pyqtSignal(np.ndarray)
-    telemetry_signal = pyqtSignal(float, float)
-
-    def __init__(self):
-        QThread.__init__(self)
-        Node.__init__(self, 'basestation_gui_node')
+# --- 1. Separated ROS 2 Node ---
+class BasestationNode(Node):
+    def __init__(self, image_signal, telemetry_signal):
+        super().__init__('basestation_gui_node')
+        self.image_signal = image_signal
+        self.telemetry_signal = telemetry_signal
         self.bridge = CvBridge()
 
-        # Subscribe to the camera (Adjust topic name if yours is different)
-        self.create_subscription(Image, '/camera/camera/color/image_raw', self.image_callback, 10)
+        # Subscribe to the compressed camera stream
+        self.create_subscription(
+            CompressedImage, 
+            '/camera/camera/color/image_raw/compressed', 
+            self.image_callback, 
+            qos_profile_sensor_data
+        )
         
-        # Subscribe to cmd_vel to read out the current speed commands
+        # Subscribe to cmd_vel
         self.create_subscription(Twist, '/cmd_vel', self.telemetry_callback, 10)
 
     def image_callback(self, msg):
         try:
-            # Convert ROS Image to OpenCV format
-            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            # Decode the compressed JPEG back into an OpenCV image
+            cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
             self.image_signal.emit(cv_image)
         except Exception as e:
             self.get_logger().error(f"Image conversion error: {e}")
@@ -41,11 +44,28 @@ class ROS2Thread(QThread, Node):
     def telemetry_callback(self, msg):
         self.telemetry_signal.emit(msg.linear.x, msg.angular.z)
 
+
+# --- 2. Separated PyQt5 Thread ---
+class ROS2Thread(QThread):
+    # Signals must be defined on the QThread class
+    image_signal = pyqtSignal(np.ndarray)
+    telemetry_signal = pyqtSignal(float, float)
+
+    def __init__(self):
+        super().__init__()
+        self.node = None
+
     def run(self):
-        rclpy.spin(self)
+        # Create the node inside the thread so Qt is happy
+        self.node = BasestationNode(self.image_signal, self.telemetry_signal)
+        rclpy.spin(self.node)
+
+    def stop(self):
+        if self.node:
+            self.node.destroy_node()
 
 
-# --- 2. PyQt5 Main Window ---
+# --- 3. PyQt5 Main Window ---
 class BasestationGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -91,7 +111,7 @@ class BasestationGUI(QMainWindow):
 
         main_layout.addLayout(right_layout, stretch=1)
 
-        # --- 3. Start ROS 2 Thread ---
+        # Start ROS 2 Thread
         self.ros_thread = ROS2Thread()
         self.ros_thread.image_signal.connect(self.update_image)
         self.ros_thread.telemetry_signal.connect(self.update_telemetry)
@@ -115,8 +135,9 @@ class BasestationGUI(QMainWindow):
 
     def closeEvent(self, event):
         # Clean up ROS 2 on window close
-        self.ros_thread.destroy_node()
+        self.ros_thread.stop()
         rclpy.shutdown()
+        self.ros_thread.wait()
         event.accept()
 
 

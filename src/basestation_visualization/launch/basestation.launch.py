@@ -3,23 +3,31 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
-        # 1. Official ROS 2 hardware driver (Spawns /joy)
+        # 1. Hardware Joystick Driver
         Node(
             package='joy',
             executable='joy_node',
             name='joy_node',
             parameters=[{
                 'deadzone': 0.05,
-                'autorepeat_rate': 20.0, # Sends /joy updates at 20Hz even if sticks are held still
+                'autorepeat_rate': 20.0,
             }],
             output='screen'
         ),
         
-        # 2. Your team's custom translation script (Reads /joy, Spawns /cmd_vel)
+        # 2. Kinematics Translation (Joy to cmd_vel)
         Node(
             package='motor_driver',   
             executable='controller_node', 
             name='controller_node',
+            output='screen'
+        ),
+
+        # 3. Basestation PyQt5 Visualizer
+        Node(
+            package='basestation_visualization',
+            executable='gui_node',
+            name='gui_node',
             output='screen'
         )
     ])
