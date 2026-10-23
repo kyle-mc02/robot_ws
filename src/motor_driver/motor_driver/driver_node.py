@@ -3,6 +3,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 import serial
 import struct
+import math
 
 class RobotDriver(Node):
     def __init__(self):
@@ -17,25 +18,26 @@ class RobotDriver(Node):
         self.subscription = self.create_subscription(
             Twist, '/cmd_vel', self.listener_callback, 10)
     
-    # Expecting a vector with (Linear vel, Angular val, ___)
+    # Expecting a twist with (Linear vel, Angular vel)
     def listener_callback(self, msg):
         # Motor = 13.5 RPM = 27/2 * 2pi/60 : pi*9/20 
         # Rated RMP = 6800 (max is 7000) = 6800 * 2pi/60 : rad/s (680/3*pi)
-        linVel = float(msg.linear.x)
-        angVel = float(msg.angular.z) 
-
-        eta = 504
-        Rwheel = 0.15/2 #in m
-        lwheels = 0.44  #in m
-        MAX_RAD_S = 712.1
-        MAX_PWM = 340.0
+        MAX_RAD_S = 680/3 * math.pi # in rad/s
+        MAX_PWM = 340.0 # True max is 400
         
+        eta = 504 # Gear ratio
+        Rwheel = 0.15/2 #in m (radius of wheels)
+        lwheels = 0.44  #in m (distance between wheels)
+        # linFactor, angFactor = 1.0, 1.0 # Scaling factors to tune velocitites.
+        
+        linVel, angVel  = float(msg.linear.x), float(msg.angular.z) 
+
         wml = (eta/Rwheel) * (linVel - 0.5*lwheels*angVel)
         wmr = (eta/Rwheel) * (linVel + 0.5*lwheels*angVel)
         
         # Constrain values to the shield's limits to prevent integer overflow
-        left = max(-340, min(340, int((wml / MAX_RAD_S) * MAX_PWM)))
-        right = max(-340, min(340, int((-wmr / MAX_RAD_S) * MAX_PWM)))
+        left = max(-MAX_PWM, min(MAX_PWM, int((wml / MAX_RAD_S) * MAX_PWM)))
+        right = max(-MAX_PWM, min(MAX_PWM, int((-wmr / MAX_RAD_S) * MAX_PWM)))
         
         if self.serial_port and self.serial_port.is_open:
             # Pack format: '<Bhh' 
