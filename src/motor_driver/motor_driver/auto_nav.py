@@ -62,7 +62,7 @@ class AutoNavNode(Node):
     def perform_step(self, step):
         msg = Twist()
         
-        linear_scale = 0.50
+        linear_scale = 0.10
         angular_scale = 1.0
 
         if step['type'] == 'drive':
