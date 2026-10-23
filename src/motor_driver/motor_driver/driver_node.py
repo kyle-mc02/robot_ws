@@ -36,8 +36,8 @@ class RobotDriver(Node):
         wmr = (eta/Rwheel) * (linVel + 0.5*lwheels*angVel)
         
         # Constrain values to the shield's limits to prevent integer overflow
-        left = max(-MAX_PWM, min(MAX_PWM, int((wml / MAX_RAD_S) * MAX_PWM)))
-        right = max(-MAX_PWM, min(MAX_PWM, int((-wmr / MAX_RAD_S) * MAX_PWM)))
+        left = int(max(-MAX_PWM, min(MAX_PWM, (wml / MAX_RAD_S) * MAX_PWM))
+        right = int(max(-MAX_PWM, min(MAX_PWM, (-wmr / MAX_RAD_S) * MAX_PWM))
         
         if self.serial_port and self.serial_port.is_open:
             # Pack format: '<Bhh' 
