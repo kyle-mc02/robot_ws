@@ -23,6 +23,14 @@ def generate_launch_description():
             output='screen'
         ),
         
+        # Auto Navigation Listener
+        Node(
+            package='motor_driver',
+            executable='auto_nav_node',
+            name='auto_nav_node',
+            output='screen'
+        ),
+
         # RealSense D435i Camera
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(realsense_launch_file),
@@ -41,3 +49,4 @@ def generate_launch_description():
             PythonLaunchDescriptionSource(velodyne_launch_file)
         )
     ])
+
