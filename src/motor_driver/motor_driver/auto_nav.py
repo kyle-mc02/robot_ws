@@ -42,10 +42,10 @@ class AutoNavNode(Node):
         # ---------------------------------------------------------
         course = [
             {'type': 'drive', 'amount': 1.0,  'speed': 0.3},
-            {'type': 'turn',  'amount': 90.0, 'speed': 0.5},
-            {'type': 'drive', 'amount': 1.0,  'speed': 0.3},
-            {'type': 'turn',  'amount': -90.0,'speed': 0.5},
-            {'type': 'drive', 'amount': 1.0,  'speed': 0.3}
+           # {'type': 'turn',  'amount': 90.0, 'speed': 0.5},
+           # {'type': 'drive', 'amount': 1.0,  'speed': 0.3},
+           # {'type': 'turn',  'amount': -90.0,'speed': 0.5},
+           # {'type': 'drive', 'amount': 1.0,  'speed': 0.3}
         ]
 
         for step in course:
@@ -62,16 +62,19 @@ class AutoNavNode(Node):
     def perform_step(self, step):
         msg = Twist()
         
+        linear_scale = 0.50
+        angular_scale = 1.0
+
         if step['type'] == 'drive':
-            duration = abs(step['amount'] / step['speed'])
+            duration = abs(step['amount'] / step['speed']) * linear_scale
             msg.linear.x = step['speed'] if step['amount'] > 0 else -step['speed']
-            self.get_logger().info(f"Driving {step['amount']}m at {step['speed']}m/s")
+            self.get_logger().info(f"Driving {step['amount']}m at {step['speed']}m/s (Tuned Duration: {duration:.2f}s")
             
         elif step['type'] == 'turn':
             radians = math.radians(step['amount'])
-            duration = abs(radians / step['speed'])
+            duration = abs(radians / step['speed']) * angular_scale
             msg.angular.z = step['speed'] if step['amount'] > 0 else -step['speed']
-            self.get_logger().info(f"Turning {step['amount']} deg at {step['speed']}rad/s")
+            self.get_logger().info(f"Turning {step['amount']} deg at {step['speed']}rad/s (Tuned Duration: {duration:.2f}s")
 
         # Interruptible loop: Check for E-Stop 20 times a second
         start_time = time.time()
