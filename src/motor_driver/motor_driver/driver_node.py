@@ -22,7 +22,7 @@ class RobotDriver(Node):
     def listener_callback(self, msg):
         # Motor = 13.5 RPM = 27/2 * 2pi/60 : pi*9/20 
         # Rated RMP = 6800 (max is 7000) = 6800 * 2pi/60 : rad/s (680/3*pi)
-        MAX_RAD_S = 680/3 * math.pi # in rad/s
+        MAX_RAD_S = 680.0/3 * math.pi # in rad/s
         MAX_PWM = 340.0 # True max is 400
         
         eta = 504 # Gear ratio
