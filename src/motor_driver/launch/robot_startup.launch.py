@@ -31,6 +31,13 @@ def generate_launch_description():
             output='screen'
         ),
 
+        Node(
+            package='motor_driver',   
+            executable='controller_node', 
+            name='controller_node',
+            output='screen'
+        ),
+
         # RealSense D435i Camera
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(realsense_launch_file),

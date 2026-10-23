@@ -14,16 +14,8 @@ def generate_launch_description():
             }],
             output='screen'
         ),
-        
-        # 2. Kinematics Translation (Joy to cmd_vel)
-        Node(
-            package='motor_driver',   
-            executable='controller_node', 
-            name='controller_node',
-            output='screen'
-        ),
 
-        # 3. Basestation PyQt5 Visualizer
+        # 2. Basestation PyQt5 Visualizer
         Node(
             package='basestation_visualization',
             executable='gui_node',
