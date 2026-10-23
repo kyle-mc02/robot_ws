@@ -5,95 +5,74 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from geometry_msgs.msg import Twist
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from std_msgs.msg import String
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, qos_profile_sensor_data
 from cv_bridge import CvBridge
 
-from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QGroupBox
+from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QGroupBox, QPushButton
 from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import pyqtSignal, QThread, Qt
+from PyQt5.QtCore import QTimer, Qt
 import cv2
-import numpy as np
 
-# --- 1. Separated ROS 2 Node ---
 class BasestationNode(Node):
-    def __init__(self, image_signal, telemetry_signal):
+    def __init__(self):
         super().__init__('basestation_gui_node')
-        self.image_signal = image_signal
-        self.telemetry_signal = telemetry_signal
         self.bridge = CvBridge()
+        self.latest_cv_image = None
+        self.linear_speed = 0.0
+        self.angular_speed = 0.0
 
         video_qos = QoSProfile(
-                reliability=ReliabilityPolicy.BEST_EFFORT,
-                history=HistoryPolicy.KEEP_LAST,
-                depth=1
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
         )
 
-        # Subscribe to the compressed camera stream
-        self.create_subscription(
-            CompressedImage, 
-            '/camera/camera/color/image_raw/compressed', 
-            self.image_callback, 
-            video_qos
-        )
-        
-        # Subscribe to cmd_vel
+        self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self.image_callback, video_qos)
         self.create_subscription(Twist, '/cmd_vel', self.telemetry_callback, 10)
+        
+        # Publisher for Mission Control
+        self.mission_pub = self.create_publisher(String, '/mission_control', 10)
 
     def image_callback(self, msg):
         try:
-            # Decode the compressed JPEG back into an OpenCV image
-            cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
-            self.image_signal.emit(cv_image)
+            self.latest_cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
         except Exception as e:
-            self.get_logger().error(f"Image conversion error: {e}")
+            pass
 
     def telemetry_callback(self, msg):
-        self.telemetry_signal.emit(msg.linear.x, msg.angular.z)
+        self.linear_speed = msg.linear.x
+        self.angular_speed = msg.angular.z
+        
+    def send_command(self, cmd):
+        msg = String()
+        msg.data = cmd
+        self.mission_pub.publish(msg)
+        self.get_logger().info(f"Sent {cmd} to robot")
 
 
-# --- 2. Separated PyQt5 Thread ---
-class ROS2Thread(QThread):
-    # Signals must be defined on the QThread class
-    image_signal = pyqtSignal(np.ndarray)
-    telemetry_signal = pyqtSignal(float, float)
-
-    def __init__(self):
-        super().__init__()
-        self.node = None
-
-    def run(self):
-        # Create the node inside the thread so Qt is happy
-        self.node = BasestationNode(self.image_signal, self.telemetry_signal)
-        rclpy.spin(self.node)
-
-    def stop(self):
-        if self.node:
-            self.node.destroy_node()
-
-
-# --- 3. PyQt5 Main Window ---
 class BasestationGUI(QMainWindow):
-    def __init__(self):
+    def __init__(self, node):
         super().__init__()
+        self.node = node
         self.setWindowTitle("Robot Basestation Control")
-        self.resize(1000, 600)
+        self.resize(1000, 650)
 
-        # Main Layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
 
-        # Left Column: Video Feed
+        # Left Column: Video
         self.video_label = QLabel("Waiting for Camera Feed...")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(640, 480)
         self.video_label.setStyleSheet("background-color: black; color: white;")
         main_layout.addWidget(self.video_label, stretch=2)
 
-        # Right Column: Telemetry & LiDAR Placeholder
+        # Right Column
         right_layout = QVBoxLayout()
         
-        # Telemetry Box
+        # Telemetry
         telemetry_group = QGroupBox("Live Telemetry")
         telemetry_inner = QVBoxLayout()
         self.linear_label = QLabel("Linear Speed (m/s): 0.00")
@@ -105,7 +84,24 @@ class BasestationGUI(QMainWindow):
         telemetry_group.setLayout(telemetry_inner)
         right_layout.addWidget(telemetry_group)
 
-        # LiDAR Placeholder Box
+        # Mission Controls
+        control_group = QGroupBox("Auto Navigation")
+        control_inner = QVBoxLayout()
+        
+        self.start_btn = QPushButton("Start Auto Mission")
+        self.start_btn.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; font-size: 16px; height: 50px;")
+        self.start_btn.clicked.connect(lambda: self.node.send_command('START'))
+        
+        self.estop_btn = QPushButton("E-STOP")
+        self.estop_btn.setStyleSheet("background-color: #dc3545; color: white; font-weight: bold; font-size: 20px; height: 60px;")
+        self.estop_btn.clicked.connect(lambda: self.node.send_command('ESTOP'))
+        
+        control_inner.addWidget(self.start_btn)
+        control_inner.addWidget(self.estop_btn)
+        control_group.setLayout(control_inner)
+        right_layout.addWidget(control_group)
+
+        # LiDAR
         lidar_group = QGroupBox("VLP-16 LiDAR (Top-Down)")
         self.lidar_label = QLabel("LiDAR Visualizer\n(Pending Implementation)")
         self.lidar_label.setAlignment(Qt.AlignCenter)
@@ -117,42 +113,33 @@ class BasestationGUI(QMainWindow):
 
         main_layout.addLayout(right_layout, stretch=1)
 
-        # Start ROS 2 Thread
-        self.ros_thread = ROS2Thread()
-        self.ros_thread.image_signal.connect(self.update_image)
-        self.ros_thread.telemetry_signal.connect(self.update_telemetry)
-        self.ros_thread.start()
+        self.ros_timer = QTimer()
+        self.ros_timer.timeout.connect(self.spin_ros)
+        self.ros_timer.start(30)
 
-    def update_image(self, cv_image):
-        # Convert OpenCV BGR to Qt RGB
-        rgb_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
+    def spin_ros(self):
+        rclpy.spin_once(self.node, timeout_sec=0.0)
         
-        qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qt_img)
-        
-        # Scale to fit the label without distorting aspect ratio
-        self.video_label.setPixmap(pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio))
-
-    def update_telemetry(self, linear, angular):
-        self.linear_label.setText(f"Linear Speed (m/s): {linear:.2f}")
-        self.angular_label.setText(f"Angular Speed (rad/s): {angular:.2f}")
-
-    def closeEvent(self, event):
-        # Clean up ROS 2 on window close
-        self.ros_thread.stop()
-        rclpy.shutdown()
-        self.ros_thread.wait()
-        event.accept()
+        if self.node.latest_cv_image is not None:
+            rgb_image = cv2.cvtColor(self.node.latest_cv_image, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            qt_img = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888)
+            self.video_label.setPixmap(QPixmap.fromImage(qt_img).scaled(self.video_label.size(), Qt.KeepAspectRatio))
+            self.node.latest_cv_image = None
+            
+        self.linear_label.setText(f"Linear Speed (m/s): {self.node.linear_speed:.2f}")
+        self.angular_label.setText(f"Angular Speed (rad/s): {self.node.angular_speed:.2f}")
 
 
 def main():
     rclpy.init()
+    node = BasestationNode()
     app = QApplication(sys.argv)
-    gui = BasestationGUI()
+    gui = BasestationGUI(node)
     gui.show()
-    sys.exit(app.exec_())
+    app.exec_()
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

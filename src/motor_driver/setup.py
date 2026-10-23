@@ -30,6 +30,7 @@ setup(
             'motor_gui_node = motor_driver.motor_gui_node:main',
             'driver_node = motor_driver.driver_node:main',
             'controller_node = motor_driver.controller_node:main',
+            'auto_nav = motor_driver.auto_nav:main',
         ],
     },
 )
