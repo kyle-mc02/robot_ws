@@ -2,6 +2,7 @@
 
 // Initialize the shield
 DualVNH5019MotorShield md;
+unsigned long last_command_ms = 0;
 
 void setup() {
   // 115200 baud to match the Python ROS 2 hardware bridge
@@ -10,6 +11,11 @@ void setup() {
 }
 
 void loop() {
+  // Stop even if the laptop crashes or the USB cable disconnects.
+  if (millis() - last_command_ms > 500) {
+    md.setM1Speed(0);
+    md.setM2Speed(0);
+  }
   // Wait until a full 5-byte packet (Header + Left + Right) is in the buffer
   if (Serial.available() >= 5) {
     
@@ -28,8 +34,9 @@ void loop() {
       // M2 = Right Side (M2A / M2B)
       // If a side spins backward when pushing the GUI slider up, swap the 
       // physical wires in that M's terminal block or add a negative sign here.
-      md.setM1Speed(left_speed);
-      md.setM2Speed(right_speed);
+      last_command_ms = millis();
+      md.setM1Speed(constrain(left_speed, -340, 340));
+      md.setM2Speed(constrain(right_speed, -340, 340));
     }
   }
 }

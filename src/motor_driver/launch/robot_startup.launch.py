@@ -45,6 +45,7 @@ def generate_launch_description():
             launch_arguments={
                 'enable_gyro': 'true', 
                 'enable_accel': 'true',
+                'unite_imu_method': '2',  # Combine gyro and accel on /camera/camera/imu.
                 'align_depth.enable': 'true',
                 'rgb_camera.color_profile': '640x480x15',
                 'depth_module.depth_profile': '640x480x15'

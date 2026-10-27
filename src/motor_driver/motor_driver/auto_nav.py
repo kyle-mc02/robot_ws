@@ -1,98 +1,72 @@
 #!/usr/bin/env python3
+"""Run the hardcoded timed mission; leave /cmd_vel to the joystick in manual mode."""
+import math
+import time
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
-import time
-import threading
-import math
 
 class AutoNavNode(Node):
     def __init__(self):
         super().__init__('auto_nav_node')
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.control_sub = self.create_subscription(String, '/mission_control', self.control_callback, 10)
-        
-        self.mission_thread = None
-        self.estop_active = False
-        self.mission_running = False
-
-        self.get_logger().info("Auto Nav Node ready. Waiting for START command from GUI...")
+        self.mission_pub = self.create_publisher(String, '/mission_control', 10)
+        self.create_subscription(String, '/mission_control', self.control_callback, 10)
+        self.mode = 'MANUAL'
+        self.steps = []
+        self.deadline = 0.0
+        self.command = Twist()
+        self.create_timer(0.05, self.publish_command)
 
     def control_callback(self, msg):
-        if msg.data == 'START':
-            if not self.mission_running:
-                self.get_logger().info("Mission START received!")
-                self.estop_active = False
-                self.mission_running = True
-                self.mission_thread = threading.Thread(target=self.execute_course)
-                self.mission_thread.start()
-            else:
-                self.get_logger().warn("Mission is already running!")
-                
-        elif msg.data == 'ESTOP':
-            self.get_logger().error("E-STOP TRIGGERED! HALTING IMMEDIATELY.")
-            self.estop_active = True
-            self.stop_robot()
+        if msg.data not in ('START', 'ESTOP', 'MANUAL'):
+            return  # Ignore our own STATE messages.
+        if msg.data == 'START' and self.mode != 'AUTO':
+            self.steps = self.build_course()
+            self.mode = 'AUTO'
+            self.deadline = 0.0
+            self.command = Twist()
+        elif msg.data in ('ESTOP', 'MANUAL'):
+            self.mode = msg.data
+            self.steps = []
+            self.cmd_pub.publish(Twist())
+        self.publish_command()
 
-    def execute_course(self):
-        # ---------------------------------------------------------
-        # TUNING SEQUENCE
-        # ---------------------------------------------------------
+    def build_course(self):
+        # (linear m/s, angular rad/s, seconds): 2m, right 90, 3m, left 90, 7m.
         course = [
-            {'type': 'drive', 'amount': 1.0,  'speed': 0.3},
-           # {'type': 'turn',  'amount': 90.0, 'speed': 0.5},
-           # {'type': 'drive', 'amount': 1.0,  'speed': 0.3},
-           # {'type': 'turn',  'amount': -90.0,'speed': 0.5},
-           # {'type': 'drive', 'amount': 1.0,  'speed': 0.3}
+            (0.05, 0.0, 2.0 / 0.05),
+            (0.0, -0.2, math.radians(90) / 0.2),
+            (0.05, 0.0, 3.0 / 0.05),
+            (0.0, 0.2, math.radians(90) / 0.2),
+            (0.05, 0.0, 7.0 / 0.05),
         ]
+        steps = []
+        for linear, angular, duration in course:
+            command = Twist()
+            command.linear.x, command.angular.z = linear, angular
+            steps.extend([(command, duration), (Twist(), 0.5)])
+        return steps
 
-        for step in course:
-            if self.estop_active or not rclpy.ok():
-                self.get_logger().warn("Mission aborted mid-course.")
-                break
-            self.perform_step(step)
+    def publish_command(self):
+        now = time.monotonic()
+        command = Twist()
+        if self.mode == 'AUTO':
+            if now >= self.deadline:
+                if self.steps:
+                    self.command, duration = self.steps.pop(0)
+                    self.deadline = now + duration
+                else:
+                    # Hold stopped until the operator explicitly selects a mode.
+                    self.mode = 'IDLE'
+                    self.command = Twist()
+            command = self.command
+        self.mission_pub.publish(String(data='STATE:' + self.mode))
+        if self.mode != 'MANUAL':
+            self.cmd_pub.publish(command)
 
-        self.stop_robot()
-        self.mission_running = False
-        if not self.estop_active:
-            self.get_logger().info("Course completed successfully!")
-
-    def perform_step(self, step):
-        msg = Twist()
-        
-        linear_scale = 0.10
-        angular_scale = 1.0
-
-        if step['type'] == 'drive':
-            duration = abs(step['amount'] / step['speed']) * linear_scale
-            msg.linear.x = step['speed'] if step['amount'] > 0 else -step['speed']
-            self.get_logger().info(f"Driving {step['amount']}m at {step['speed']}m/s (Tuned Duration: {duration:.2f}s")
-            
-        elif step['type'] == 'turn':
-            radians = math.radians(step['amount'])
-            duration = abs(radians / step['speed']) * angular_scale
-            msg.angular.z = step['speed'] if step['amount'] > 0 else -step['speed']
-            self.get_logger().info(f"Turning {step['amount']} deg at {step['speed']}rad/s (Tuned Duration: {duration:.2f}s")
-
-        # Interruptible loop: Check for E-Stop 20 times a second
-        start_time = time.time()
-        while time.time() - start_time < duration:
-            if self.estop_active or not rclpy.ok():
-                return  # Bail out instantly
-            
-            # Continuously publish to override any joystick noise
-            self.cmd_pub.publish(msg)
-            time.sleep(0.05) 
-        
-        self.stop_robot()
-        if not self.estop_active:
-            time.sleep(0.5)
-
-    def stop_robot(self):
-        msg = Twist()
-        self.cmd_pub.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)
@@ -102,9 +76,12 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.stop_robot()
+        if rclpy.ok():
+            node.cmd_pub.publish(Twist())
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
