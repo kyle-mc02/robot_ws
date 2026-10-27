@@ -37,10 +37,10 @@ class AutoNavNode(Node):
     def build_course(self):
         # (linear m/s, angular rad/s, seconds): 2m, right 90, 3m, left 90, 7m.
         course = [
+            (0.05, 0.0, 6.75), # current tuned 3m
+            (0.0, -0.2, 2.2), # current tuned right turn
             (0.05, 0.0, 6.75),
-            (0.0, -0.2, 2.2),
-            #(0.05, 0.0, 3.0 / 0.05),
-            #(0.0, 0.2, math.radians(90) / 0.2),
+            (0.0, 0.2, 2.2),
             #(0.05, 0.0, 7.0 / 0.05),
         ]
         steps = []
