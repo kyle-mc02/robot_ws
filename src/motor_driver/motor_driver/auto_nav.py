@@ -14,7 +14,7 @@ class AutoNavNode(Node):
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.mission_pub = self.create_publisher(String, '/mission_control', 10)
         self.create_subscription(String, '/mission_control', self.control_callback, 10)
-        self.mode = 'MANUAL'
+        self.mode = 'ESTOP'
         self.steps = []
         self.deadline = 0.0
         self.command = Twist()
@@ -37,11 +37,12 @@ class AutoNavNode(Node):
     def build_course(self):
         # (linear m/s, angular rad/s, seconds): 2m, right 90, 3m, left 90, 7m.
         course = [
-            (0.05, 0.0, 2.0 / 0.05),
-            (0.0, -0.2, math.radians(90) / 0.2),
-            (0.05, 0.0, 3.0 / 0.05),
-            (0.0, 0.2, math.radians(90) / 0.2),
-            (0.05, 0.0, 7.0 / 0.05),
+            (0.05, 0.0, 20)
+            #(0.05, 0.0, 2.0 / 0.05),
+            #(0.0, -0.2, math.radians(90) / 0.2),
+            #(0.05, 0.0, 3.0 / 0.05),
+            #(0.0, 0.2, math.radians(90) / 0.2),
+            #(0.05, 0.0, 7.0 / 0.05),
         ]
         steps = []
         for linear, angular, duration in course:
@@ -58,9 +59,13 @@ class AutoNavNode(Node):
                 if self.steps:
                     self.command, duration = self.steps.pop(0)
                     self.deadline = now + duration
+                    self.get_logger().info(
+                        f'AUTO segment: linear={self.command.linear.x:.3f} m/s, '
+                        f'angular={self.command.angular.z:.3f} rad/s, duration={duration:.2f} s')
                 else:
                     # Hold stopped until the operator explicitly selects a mode.
                     self.mode = 'IDLE'
+                    self.get_logger().info('AUTO complete; holding stopped in IDLE')
                     self.command = Twist()
             command = self.command
         self.mission_pub.publish(String(data='STATE:' + self.mode))

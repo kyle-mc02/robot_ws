@@ -53,7 +53,7 @@ class JoyToCmdVel(Node):
         self.command = Twist()
 
         self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.mode = 'IDLE'
+        self.mode = 'ESTOP'
         self.mode_received = float('-inf')
         self.create_subscription(String, '/mission_control', self.mode_callback, 10)
 

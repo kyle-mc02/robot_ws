@@ -25,6 +25,7 @@ class BasestationNode(Node):
         self.mission_status = 'Waiting for robot'
         self.last_command_time = float('-inf')
         self.linear_speed = 0.0
+        self.angular_speed = 0.0
         self.imu = None
         self.last_imu_time = float('-inf')
 
@@ -70,6 +71,7 @@ class BasestationNode(Node):
     def telemetry_callback(self, msg):
         self.last_command_time = time.monotonic()
         self.linear_speed = msg.linear.x
+        self.angular_speed = msg.angular.z
         
     def imu_callback(self, msg):
         self.imu = msg
@@ -107,12 +109,16 @@ class BasestationGUI(QMainWindow):
         telemetry_group = QGroupBox("Motion Telemetry")
         telemetry_inner = QVBoxLayout()
         self.linear_label = QLabel("Requested Linear (m/s): 0.00")
+        self.requested_angular_label = QLabel("Requested Angular (rad/s): 0.00")
         self.angular_label = QLabel("IMU gyro: waiting")
         self.accel_label = QLabel("IMU acceleration: waiting")
         self.imu_frame_label = QLabel("IMU frame: waiting")
-        self.linear_label.setStyleSheet("font-size: 16px; font-weight: bold;")
-        self.angular_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        for label in (self.linear_label, self.requested_angular_label,
+                      self.angular_label, self.accel_label, self.imu_frame_label):
+            label.setStyleSheet("font-size: 16px; font-weight: bold;")
+            label.setWordWrap(True)
         telemetry_inner.addWidget(self.linear_label)
+        telemetry_inner.addWidget(self.requested_angular_label)
         telemetry_inner.addWidget(self.angular_label)
         telemetry_inner.addWidget(self.accel_label)
         telemetry_inner.addWidget(self.imu_frame_label)
@@ -180,7 +186,9 @@ class BasestationGUI(QMainWindow):
         self.status_label.setText(self.node.mission_status if connected else 'Robot commands unavailable')
         if not connected:
             self.node.linear_speed = 0.0
+            self.node.angular_speed = 0.0
         self.linear_label.setText(f"Requested Linear (m/s): {self.node.linear_speed:.2f}")
+        self.requested_angular_label.setText(f"Requested Angular (rad/s): {self.node.angular_speed:.2f}")
         if time.monotonic() - self.node.last_imu_time < 1.0:
             gyro = self.node.imu.angular_velocity
             accel = self.node.imu.linear_acceleration
