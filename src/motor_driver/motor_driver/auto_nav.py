@@ -38,7 +38,7 @@ class AutoNavNode(Node):
         # (linear m/s, angular rad/s, seconds): 2m, right 90, 3m, left 90, 7m.
         course = [
             (0.05, 0.0, 6.75), # current tuned 3m
-            (0.0, -0.2, 2.255), # current tuned right turn
+            (0.0, -0.2, 2.25), # current tuned right turn
             (0.05, 0.0, 6.75),
             (0.0, 0.2, 2.1),
             #(0.05, 0.0, 7.0 / 0.05),
