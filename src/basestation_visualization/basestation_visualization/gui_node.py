@@ -57,12 +57,23 @@ class BasestationNode(Node):
 
     def lidar_callback(self, msg):
         # Sensor coordinates: forward is up, left is left. Show +/-10 metres.
-        fields = point_cloud2.read_points(msg, field_names=('x', 'y')).reshape(-1)
-        points = np.column_stack((fields['x'], fields['y']))
-        points = points[np.isfinite(points).all(axis=1) & (np.abs(points) < 10).all(axis=1)]
-        pixels = (200 - points[:, ::-1] * 20).astype(int)
+        fields = point_cloud2.read_points(msg, field_names=('x', 'y', 'z')).reshape(-1)
+        points = np.column_stack([fields[name] for name in ('x', 'y', 'z')])
+        points = points[np.isfinite(points).all(axis=1) & (np.abs(points[:, :2]) < 10).all(axis=1)]
+        pixels = (200 - points[:, [1, 0]] * 20).astype(int)
+        # Fixed sensor-relative scale prevents colors shifting between frames.
+        heights = np.full(401 * 401, -np.inf)
+        np.maximum.at(heights, pixels[:, 1] * 401 + pixels[:, 0], points[:, 2])
+        occupied = np.isfinite(heights)
+        levels = np.zeros(heights.shape, dtype=np.uint8)
+        levels[occupied] = (np.clip((heights[occupied] + 1.0) / 3.0, 0, 1) * 255).astype(np.uint8)
+        # OpenCV outputs BGR; the LiDAR QImage below expects RGB.
+        colors = cv2.applyColorMap(levels.reshape(401, 401), cv2.COLORMAP_JET)[:, :, ::-1]
         image = np.zeros((401, 401, 3), dtype=np.uint8)
-        image[pixels[:, 1], pixels[:, 0]] = (0, 255, 0)
+        mask = occupied.reshape(401, 401)
+        image[mask] = colors[mask]
+        cv2.putText(image, 'Height: blue <= -1m / red >= +2m', (8, 390),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
         cv2.circle(image, (200, 200), 4, (255, 255, 255), -1)
         self.latest_lidar_image = image
 
@@ -147,7 +158,7 @@ class BasestationGUI(QMainWindow):
         right_layout.addWidget(control_group)
 
         # LiDAR
-        lidar_group = QGroupBox("VLP-16 points (±10 m)")
+        lidar_group = QGroupBox("VLP-16 height (sensor frame, ±10 m)")
         self.lidar_label = QLabel("Waiting for /reduced_lidar_points")
         self.lidar_label.setAlignment(Qt.AlignCenter)
         self.lidar_label.setStyleSheet("background-color: #2b2b2b; color: #00ff00;")
