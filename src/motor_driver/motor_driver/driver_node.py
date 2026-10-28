@@ -14,7 +14,7 @@ from sensor_msgs_py import point_cloud2
 class RobotDriver(Node):
     def __init__(self):
         super().__init__('robot_driver')
-        self.declare_parameter('lidar_max_points', 4000)
+        self.declare_parameter('lidar_max_points', 2000)
         self.add_on_set_parameters_callback(self.validate_lidar_parameters)
         initial_limit = self.get_parameter('lidar_max_points').value
         if type(initial_limit) is not int or not 1 <= initial_limit <= 100000:
