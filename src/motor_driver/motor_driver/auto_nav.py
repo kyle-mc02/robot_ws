@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Run the hardcoded timed mission; leave /cmd_vel to the joystick in manual mode."""
-import math
 import time
 
 import rclpy
@@ -35,13 +34,11 @@ class AutoNavNode(Node):
         self.publish_command()
 
     def build_course(self):
-        # (linear m/s, angular rad/s, seconds): 2m, right 90, 3m, left 90, 7m.
+        # (linear request, angular request, seconds). Speeds are not measured.
         course = [
-            (0.05, 0.0, 6.75), # current tuned 3m
-            (0.0, -0.2, 2.25), # current tuned right turn
-            (0.05, 0.0, 6.75),
-            (0.0, 0.2, 2.05),
-            #(0.05, 0.0, 7.0 / 0.05),
+            (0.05, 0.0, 6.75),  # Tuned 3 m forward.
+            (0.0, 0.2, 2.05),   # Tuned left 90 degrees.
+            (0.05, 0.0, 6.75 * 7.0 / 3.0),  # Estimated 7 m; validate on floor.
         ]
         steps = []
         for linear, angular, duration in course:

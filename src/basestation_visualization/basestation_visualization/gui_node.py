@@ -5,11 +5,12 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import CompressedImage, LaserScan, Imu
+from sensor_msgs.msg import CompressedImage, PointCloud2, Imu
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
+from sensor_msgs_py import point_cloud2
 
 from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, QWidget, QGroupBox, QPushButton
 from PyQt5.QtGui import QImage, QPixmap
@@ -38,7 +39,7 @@ class BasestationNode(Node):
         self.create_subscription(CompressedImage, '/camera/camera/color/image_raw/compressed', self.image_callback, video_qos)
         self.create_subscription(Twist, '/cmd_vel', self.telemetry_callback, 10)
         self.create_subscription(String, '/mission_control', self.status_callback, 10)
-        self.create_subscription(LaserScan, '/scan', self.lidar_callback, video_qos)
+        self.create_subscription(PointCloud2, '/reduced_lidar_points', self.lidar_callback, video_qos)
         self.create_subscription(Imu, '/camera/camera/imu', self.imu_callback, video_qos)
         
         # Publisher for Mission Control
@@ -56,11 +57,8 @@ class BasestationNode(Node):
 
     def lidar_callback(self, msg):
         # Sensor coordinates: forward is up, left is left. Show +/-10 metres.
-        ranges = np.asarray(msg.ranges)
-        angles = msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
-        valid = np.isfinite(ranges) & (ranges >= msg.range_min) & (ranges <= msg.range_max)
-        ranges, angles = ranges[valid], angles[valid]
-        points = np.column_stack((ranges * np.cos(angles), ranges * np.sin(angles)))
+        fields = point_cloud2.read_points(msg, field_names=('x', 'y')).reshape(-1)
+        points = np.column_stack((fields['x'], fields['y']))
         points = points[np.isfinite(points).all(axis=1) & (np.abs(points) < 10).all(axis=1)]
         pixels = (200 - points[:, ::-1] * 20).astype(int)
         image = np.zeros((401, 401, 3), dtype=np.uint8)
@@ -149,8 +147,8 @@ class BasestationGUI(QMainWindow):
         right_layout.addWidget(control_group)
 
         # LiDAR
-        lidar_group = QGroupBox("VLP-16 scan (one ring, ±10 m)")
-        self.lidar_label = QLabel("Waiting for /scan")
+        lidar_group = QGroupBox("VLP-16 points (±10 m)")
+        self.lidar_label = QLabel("Waiting for /reduced_lidar_points")
         self.lidar_label.setAlignment(Qt.AlignCenter)
         self.lidar_label.setStyleSheet("background-color: #2b2b2b; color: #00ff00;")
         lidar_layout = QVBoxLayout()

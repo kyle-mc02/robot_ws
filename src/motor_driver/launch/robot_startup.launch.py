@@ -1,14 +1,26 @@
 import os
+import yaml
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from launch.actions import IncludeLaunchDescription
+from launch.actions import IncludeLaunchDescription, RegisterEventHandler, EmitEvent
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
-    # 1. Velodyne VLP-16 Launch setup
-    velodyne_share_dir = get_package_share_directory('velodyne')
-    velodyne_launch_file = os.path.join(velodyne_share_dir, 'launch', 'velodyne-all-nodes-VLP16-launch.py')
+    # Start only Velodyne acquisition and point-cloud conversion, not LaserScan.
+    driver_share = get_package_share_directory('velodyne_driver')
+    cloud_share = get_package_share_directory('velodyne_pointcloud')
+    driver_config = os.path.join(driver_share, 'config', 'VLP16-velodyne_driver_node-params.yaml')
+    cloud_config = os.path.join(cloud_share, 'config', 'VLP16-velodyne_transform_node-params.yaml')
+    with open(cloud_config) as config:
+        cloud_parameters = yaml.safe_load(config)['velodyne_transform_node']['ros__parameters']
+    cloud_parameters['calibration'] = os.path.join(cloud_share, 'params', 'VLP16db.yaml')
+    velodyne_driver = Node(package='velodyne_driver', executable='velodyne_driver_node',
+                           output='screen', parameters=[driver_config])
+    velodyne_cloud = Node(package='velodyne_pointcloud', executable='velodyne_transform_node',
+                          output='screen', parameters=[cloud_parameters])
 
     # 2. RealSense D435i Launch setup
     realsense_share_dir = get_package_share_directory('realsense2_camera')
@@ -52,9 +64,10 @@ def generate_launch_description():
             }.items()
         ),
 
-        # Velodyne VLP-16 LiDAR
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(velodyne_launch_file)
-        )
+        # Keep acquisition failure behavior from the upstream Velodyne launch.
+        velodyne_driver,
+        velodyne_cloud,
+        RegisterEventHandler(OnProcessExit(
+            target_action=velodyne_driver,
+            on_exit=[EmitEvent(event=Shutdown())]))
     ])
-
