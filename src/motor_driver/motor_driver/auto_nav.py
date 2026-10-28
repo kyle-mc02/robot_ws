@@ -36,8 +36,8 @@ class AutoNavNode(Node):
     def build_course(self):
         # (linear request, angular request, seconds). Speeds are not measured.
         course = [
-            (0.05, 0.0, 6.85),  # Tuned 3 m forward.
-            (0.0, 0.2, 2.0),   # Tuned left 90 degrees.
+            (0.05, 0.0, 6.9),  # Tuned 3 m forward.
+            (0.0, 0.2, 1.9),   # Tuned left 90 degrees.
             (0.05, 0.0, 15.6),  # Estimated 7 m; validate on floor.
         ]
         steps = []
