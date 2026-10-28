@@ -56,7 +56,7 @@ class BasestationNode(Node):
             self.mission_status = msg.data[6:]
 
     def lidar_callback(self, msg):
-        # Sensor coordinates: forward is up, left is left. Show +/-10 metres.
+        # Sensor-frame projection, +/-10 m. Measured robot forward is down in this view.
         fields = point_cloud2.read_points(msg, field_names=('x', 'y', 'z')).reshape(-1)
         points = np.column_stack([fields[name] for name in ('x', 'y', 'z')])
         points = points[np.isfinite(points).all(axis=1) & (np.abs(points[:, :2]) < 10).all(axis=1)]
@@ -74,7 +74,13 @@ class BasestationNode(Node):
         image[mask] = colors[mask]
         cv2.putText(image, 'Height: blue <= -1m / red >= +2m', (8, 390),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-        cv2.circle(image, (200, 200), 4, (255, 255, 255), -1)
+        # Center-mounted LiDAR: 0.52 m front/back, 0.49 m across, at 20 px/m.
+        # Subpixel coordinates preserve the measured dimensions before rasterizing.
+        half_width, half_length = 0.49 * 20 / 2, 0.52 * 20 / 2
+        corner_min = (round((200-half_width)*256), round((200-half_length)*256))
+        corner_max = (round((200+half_width)*256), round((200+half_length)*256))
+        cv2.rectangle(image, corner_min, corner_max, (255, 255, 255), 1, shift=8)
+        cv2.arrowedLine(image, (200, 198), (200, 204), (255, 255, 255), 1, tipLength=0.5)
         self.latest_lidar_image = image
 
     def telemetry_callback(self, msg):
