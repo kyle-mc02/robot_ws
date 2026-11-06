@@ -60,10 +60,15 @@ class BasestationNode(Node):
     def image_callback(self, msg):
         try:
             frame = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
-            self.draw_detection_overlay(frame, msg.header)
-            self.latest_cv_image = frame
         except Exception as e:
             self.get_logger().warning(f"Camera decode failed: {e}")
+            return
+        try:
+            self.draw_detection_overlay(frame, msg.header)
+        except Exception as e:
+            # Perception metadata must never block otherwise valid video.
+            self.get_logger().warning(f"Detection overlay failed: {e}")
+        self.latest_cv_image = frame
 
     def camera_info_callback(self, msg):
         self.camera_info = msg
@@ -90,8 +95,8 @@ class BasestationNode(Node):
     def draw_detection_overlay(self, frame, image_header):
         """Overlay fresh perception metadata on the original camera stream."""
         pose, point, info = self.detected_pose, self.detected_center, self.camera_info
-        fresh_pose = (pose is not None and time.monotonic()-self.last_detection_time < 0.4
-                      and abs(self.stamp_seconds(pose.header)-self.stamp_seconds(image_header)) < 0.25)
+        fresh_pose = (pose is not None and time.monotonic()-self.last_detection_time < 0.6
+                      and abs(self.stamp_seconds(pose.header)-self.stamp_seconds(image_header)) < 0.5)
         lines = ['Object: unavailable / stale']
         if fresh_pose:
             position, q = pose.pose.position, pose.pose.orientation

@@ -156,6 +156,7 @@ class Perception(Node):
             'box_dimensions': [0.42, 0.32, 0.055],
             'brown_hsv_low': [5, 40, 25], 'brown_hsv_high': [35, 255, 255],
             'min_contour_area': 1200.0, 'sync_slop': 0.04,
+            'processing_rate_hz': 3.0,
             'depth_tolerance': 0.04, 'max_reprojection_error': 4.0}
         self.values = {}
         for name, value in defaults.items():
@@ -178,6 +179,10 @@ class Perception(Node):
         for name in ('min_contour_area', 'sync_slop', 'depth_tolerance', 'max_reprojection_error'):
             if not math.isfinite(p[name]) or p[name] <= 0:
                 raise ValueError(f'{name} must be positive and finite')
+        rate = p['processing_rate_hz']
+        if not math.isfinite(rate) or not 0 < rate <= 15:
+            raise ValueError('processing_rate_hz must be positive and <= 15')
+        cv2.setNumThreads(1)  # Avoid competing with camera encoding across CPU cores.
         self.bridge = CvBridge()
         self.buffer = Buffer()
         self.listener = TransformListener(self.buffer, self)
@@ -192,18 +197,30 @@ class Perception(Node):
             q = transform.transform.rotation
             q.x, q.y, q.z, q.w = sr*cp*cy-cr*sp*sy, cr*sp*cy+sr*cp*sy, cr*cp*sy-sr*sp*cy, cr*cp*cy+sr*sp*sy
             self.broadcaster.sendTransform(transform)
-        self.point_camera_pub = self.create_publisher(PointStamped, '/perception/point_camera', 10)
-        self.point_base_pub = self.create_publisher(PointStamped, '/perception/point_base', 10)
-        self.pose_pub = self.create_publisher(PoseStamped, '/perception/box_pose', 10)
-        self.marker_pub = self.create_publisher(MarkerArray, '/perception/markers', 10)
+        self.point_camera_pub = self.create_publisher(PointStamped, '/perception/point_camera', qos_profile_sensor_data)
+        self.point_base_pub = self.create_publisher(PointStamped, '/perception/point_base', qos_profile_sensor_data)
+        self.pose_pub = self.create_publisher(PoseStamped, '/perception/box_pose', qos_profile_sensor_data)
+        self.marker_pub = self.create_publisher(MarkerArray, '/perception/markers', qos_profile_sensor_data)
         self.debug_pub = self.create_publisher(CompressedImage, '/perception/debug/compressed', qos_profile_sensor_data)
         self.rgb_sub = message_filters.Subscriber(self, Image, p['rgb_topic'], qos_profile=qos_profile_sensor_data)
         self.depth_sub = message_filters.Subscriber(self, Image, p['depth_topic'], qos_profile=qos_profile_sensor_data)
         self.info_sub = message_filters.Subscriber(self, CameraInfo, p['info_topic'], qos_profile=qos_profile_sensor_data)
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub, self.info_sub], queue_size=5, slop=p['sync_slop'])
-        self.sync.registerCallback(self.process)
+        self.latest_frames = None
+        self.sync.registerCallback(self.queue_frames)
+        self.create_timer(1.0 / rate, self.process_latest)
         self.last_warning = -float('inf')
+        self.get_logger().info(
+            f'Perception at up to {rate:g} Hz; run on the robot so raw RGB/depth stay local.')
+
+    def queue_frames(self, rgb, depth_msg, info):
+        self.latest_frames = (rgb, depth_msg, info)
+
+    def process_latest(self):
+        frames, self.latest_frames = self.latest_frames, None
+        if frames is not None:
+            self.process(*frames)
 
     def warn(self, message):
         now = self.get_clock().now().nanoseconds / 1e9
