@@ -8,7 +8,6 @@ import math
 
 import cv2
 import numpy as np
-import message_filters
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -60,7 +59,7 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area):
         hull = cv2.convexHull(contour)
         quad = cv2.approxPolyDP(hull, 0.025 * cv2.arcLength(hull, True), True)
         if len(quad) != 4 or not cv2.isContourConvex(quad):
-            continue
+            quad = cv2.boxPoints(cv2.minAreaRect(hull)).astype(np.int32).reshape(4, 1, 2)
         region = np.zeros(mask.shape, np.uint8)
         cv2.fillConvexPoly(region, quad, 255)
         if np.count_nonzero((brown > 0) & (region > 0)) < 0.25 * np.count_nonzero(region):
@@ -153,7 +152,7 @@ class Perception(Node):
     def __init__(self):
         super().__init__('perception')
         defaults = {
-            'rgb_topic': '/camera/camera/color/image_raw',
+            'rgb_topic': '/camera/camera/color/image_raw/compressed',
             'depth_topic': '/camera/camera/aligned_depth_to_color/image_raw',
             'info_topic': '/camera/camera/color/camera_info',
             'base_frame': 'base_link', 'mount_frame': 'camera_link',
@@ -161,7 +160,7 @@ class Perception(Node):
             'mount_rpy': [0.0, 0.0, 0.0],
             'box_dimensions': [0.42, 0.32, 0.055],
             'brown_hsv_low': [0, 25, 20], 'brown_hsv_high': [40, 255, 255],
-            'min_contour_area': 1200.0, 'sync_slop': 0.04,
+            'min_contour_area': 1200.0,
             'processing_rate_hz': 3.0,
             'depth_tolerance': 0.04, 'max_reprojection_error': 4.0}
         self.values = {}
@@ -182,7 +181,7 @@ class Perception(Node):
                 raise ValueError(f'Invalid {name}')
         if np.any(np.array(p['brown_hsv_low']) > p['brown_hsv_high']):
             raise ValueError('HSV lower bound must not exceed upper bound')
-        for name in ('min_contour_area', 'sync_slop', 'depth_tolerance', 'max_reprojection_error'):
+        for name in ('min_contour_area', 'depth_tolerance', 'max_reprojection_error'):
             if not math.isfinite(p[name]) or p[name] <= 0:
                 raise ValueError(f'{name} must be positive and finite')
         rate = p['processing_rate_hz']
@@ -208,14 +207,12 @@ class Perception(Node):
         self.pose_pub = self.create_publisher(PoseStamped, '/perception/box_pose', qos_profile_sensor_data)
         self.marker_pub = self.create_publisher(MarkerArray, '/perception/markers', qos_profile_sensor_data)
         self.debug_pub = self.create_publisher(CompressedImage, '/perception/debug/compressed', qos_profile_sensor_data)
-        self.rgb_sub = message_filters.Subscriber(self, Image, p['rgb_topic'], qos_profile=qos_profile_sensor_data)
-        self.depth_sub = message_filters.Subscriber(self, Image, p['depth_topic'], qos_profile=qos_profile_sensor_data)
+        self.latest_rgb = None
+        self.latest_depth = None
         self.camera_info = None
+        self.rgb_sub = self.create_subscription(CompressedImage, p['rgb_topic'], self.rgb_callback, qos_profile_sensor_data)
+        self.depth_sub = self.create_subscription(Image, p['depth_topic'], self.depth_callback, qos_profile_sensor_data)
         self.info_sub = self.create_subscription(CameraInfo, p['info_topic'], self.info_callback, qos_profile_sensor_data)
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            [self.rgb_sub, self.depth_sub], queue_size=2, slop=p['sync_slop'])
-        self.latest_frames = None
-        self.sync.registerCallback(self.queue_rgbd)
         self.create_timer(1.0 / rate, self.process_latest)
         self.last_warning = -float('inf')
         self.get_logger().info(
@@ -224,17 +221,57 @@ class Perception(Node):
     def info_callback(self, info):
         self.camera_info = info
 
-    def queue_rgbd(self, rgb, depth_msg):
-        if self.camera_info is not None:
-            self.queue_frames(rgb, depth_msg, self.camera_info)
+    def rgb_callback(self, rgb):
+        self.latest_rgb = rgb
 
-    def queue_frames(self, rgb, depth_msg, info):
-        self.latest_frames = (rgb, depth_msg, info)
+    def depth_callback(self, depth):
+        self.latest_depth = depth
 
     def process_latest(self):
-        frames, self.latest_frames = self.latest_frames, None
-        if frames is not None:
-            self.process(*frames)
+        rgb, self.latest_rgb = self.latest_rgb, None
+        if rgb is None:
+            return
+        try:
+            bgr = self.bridge.compressed_imgmsg_to_cv2(rgb, 'bgr8')
+            detection = detect_face(bgr, self.values['brown_hsv_low'], self.values['brown_hsv_high'],
+                                    self.values['min_contour_area'])
+            info = self.camera_info
+            if detection is None:
+                self.marker_pub.publish(MarkerArray(markers=[Marker(
+                    ns='detection_rays', id=4, action=Marker.DELETE)]))
+                return
+            if info is None or info.header.frame_id != rgb.header.frame_id:
+                self.warn('Brown region detected; waiting for matching color CameraInfo')
+                return
+            k = np.asarray(info.k, np.float64).reshape(3, 3)
+            if (info.width, info.height) != (bgr.shape[1], bgr.shape[0]) or k[0, 0] <= 0 or k[1, 1] <= 0:
+                self.warn('Brown region detected; CameraInfo dimensions/intrinsics mismatch')
+                return
+            # Viewing rays encode the 2D detection without claiming a 3D location.
+            # RViz can display these rays; the GUI projects their endpoints to RGB.
+            pixels = np.vstack([detection[0], detection[1]])
+            xy = cv2.undistortPoints(pixels.reshape(-1, 1, 2), k, np.asarray(info.d, np.float64)).reshape(-1, 2)
+            rays = Marker(header=rgb.header, ns='detection_rays', id=4,
+                          type=Marker.LINE_LIST, action=Marker.ADD)
+            rays.pose.orientation.w = 1.
+            rays.scale.x = 0.002
+            rays.color.g, rays.color.a = 1., 0.15
+            rays.lifetime.nanosec = 600000000
+            rays.points = []
+            for x, y in xy:
+                rays.points.extend([Point(), Point(x=float(x), y=float(y), z=1.)])
+            self.marker_pub.publish(MarkerArray(markers=[rays]))
+            depth = self.latest_depth
+            if depth is None or abs(self.stamp_seconds(depth.header)-self.stamp_seconds(rgb.header)) > 0.1:
+                self.warn('2D detection active; aligned depth is missing or older than 0.1 s')
+                return
+            self.process(rgb, depth, info, bgr=bgr, detection=detection)
+        except (ValueError, CvBridgeError, cv2.error) as error:
+            self.warn(str(error))
+
+    @staticmethod
+    def stamp_seconds(header):
+        return header.stamp.sec + header.stamp.nanosec * 1e-9
 
     def warn(self, message):
         now = self.get_clock().now().nanoseconds / 1e9
@@ -242,11 +279,13 @@ class Perception(Node):
             self.get_logger().warning(message)
             self.last_warning = now
 
-    def process(self, rgb, depth_msg, info):
+    def process(self, rgb, depth_msg, info, bgr=None, detection=None):
         try:
+            if bgr is None:
+                bgr = self.bridge.imgmsg_to_cv2(rgb, 'bgr8')
             if not rgb.header.frame_id or info.header.frame_id != rgb.header.frame_id or depth_msg.header.frame_id != rgb.header.frame_id:
                 raise ValueError('RGB, aligned depth and CameraInfo must share the color optical frame')
-            if (rgb.width, rgb.height) != (depth_msg.width, depth_msg.height) or (info.width, info.height) != (rgb.width, rgb.height):
+            if (bgr.shape[1], bgr.shape[0]) != (depth_msg.width, depth_msg.height) or (info.width, info.height) != (bgr.shape[1], bgr.shape[0]):
                 raise ValueError('RGB, aligned depth and CameraInfo dimensions must match')
             if info.distortion_model not in ('plumb_bob', 'rational_polynomial'):
                 raise ValueError('Unsupported distortion model; use calibrated plumb_bob/rational_polynomial RGB')
@@ -254,10 +293,10 @@ class Perception(Node):
             distortion = np.asarray(info.d, np.float64)
             if not np.isfinite(k).all() or k[0, 0] <= 0 or k[1, 1] <= 0 or not np.isfinite(distortion).all():
                 raise ValueError('Invalid camera intrinsics')
-            bgr = self.bridge.imgmsg_to_cv2(rgb, 'bgr8')
             depth = depth_in_meters(self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough'), depth_msg.encoding)
-            detection = detect_face(bgr, self.values['brown_hsv_low'], self.values['brown_hsv_high'],
-                                    self.values['min_contour_area'])
+            if detection is None:
+                detection = detect_face(bgr, self.values['brown_hsv_low'], self.values['brown_hsv_high'],
+                                        self.values['min_contour_area'])
             if detection is None:
                 self.warn('No brown rectangular target found; check lighting and brown_hsv_low/high')
                 return

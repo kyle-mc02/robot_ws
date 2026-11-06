@@ -32,6 +32,8 @@ class BasestationNode(Node):
         self.imu = None
         self.last_imu_time = float('-inf')
         self.camera_info = None
+        self.detection_rays = None
+        self.last_rays_time = float('-inf')
         self.detected_center = None
         self.detected_contour = None
         self.detected_pose = None
@@ -74,9 +76,11 @@ class BasestationNode(Node):
         self.camera_info = msg
 
     def detection_markers_callback(self, msg):
-        self.detected_center = None
-        self.detected_contour = None
         for marker in msg.markers:
+            if marker.ns == 'detection_rays':
+                self.detection_rays = marker if marker.action == Marker.ADD else None
+                self.last_rays_time = time.monotonic()
+                continue
             if marker.action != Marker.ADD:
                 continue
             if marker.ns == 'box_center_camera':
@@ -140,6 +144,23 @@ class BasestationNode(Node):
                                         outline = np.clip(outline.reshape(-1, 2), -10000, 10000).astype(np.int32)
                                         cv2.polylines(frame, [outline], True, (0, 255, 0), 2)
                             cv2.circle(frame, (u, v), 4, (0, 255, 255), -1)
+        rays = self.detection_rays
+        if (rays is not None and info is not None and len(rays.points) == 10
+                and time.monotonic()-self.last_rays_time < 0.6
+                and rays.header.frame_id == image_header.frame_id == info.header.frame_id
+                and abs(self.stamp_seconds(rays.header)-self.stamp_seconds(image_header)) < 0.5
+                and (info.width, info.height) == (frame.shape[1], frame.shape[0])):
+            endpoints = np.array([[p.x,p.y,p.z] for p in rays.points[1::2]], np.float64)
+            if np.isfinite(endpoints).all() and np.all(endpoints[:,2] > 0):
+                pixels, _ = cv2.projectPoints(endpoints, np.zeros(3), np.zeros(3),
+                                             np.asarray(info.k,np.float64).reshape(3,3), np.asarray(info.d,np.float64))
+                if np.isfinite(pixels).all():
+                    pixels = np.clip(pixels.reshape(-1,2), -10000,10000).astype(np.int32)
+                    cv2.polylines(frame, [pixels[:4]], True, (0,255,0), 2)
+                    # A depth-based box center replaces this centroid when a current pose exists.
+                    if not fresh_pose:
+                        cv2.circle(frame, tuple(pixels[4]), 4, (0,255,255), -1)
+                        lines = ['Brown target detected', 'Distance / pose unavailable (depth or TF)']
         scale, thickness = 0.48, 1
         widths = [cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0] for line in lines]
         panel_width = min(frame.shape[1]-1, max(widths)+20)
