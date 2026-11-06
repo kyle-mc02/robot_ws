@@ -44,42 +44,42 @@ def deproject(pixel, z, k, distortion):
 
 
 def detect_face(bgr, hsv_low, hsv_high, minimum_area):
-    """Find a convex four-corner boundary with brown fill and black markings."""
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    """Brown-first segmentation; dark stripes are allowed, never required."""
+    # Work at <=320 px width rather than running Canny across every full RGB frame.
+    scale = min(1.0, 320.0 / bgr.shape[1])
+    small = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else bgr
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     brown = cv2.inRange(hsv, np.array(hsv_low, np.uint8), np.array(hsv_high, np.uint8))
-    black = cv2.inRange(hsv, np.array([0, 0, 0], np.uint8), np.array([179, 255, 75], np.uint8))
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 40, 120)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+    # Reconnect brown regions split by black lines; fill internal stripe gaps.
+    mask = cv2.morphologyEx(brown, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:10]:
         area = cv2.contourArea(contour)
-        if area < minimum_area or area > bgr.shape[0] * bgr.shape[1] * 0.9:
+        if area < minimum_area * scale**2 or area > small.shape[0] * small.shape[1] * 0.9:
             continue
-        quad = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
+        hull = cv2.convexHull(contour)
+        quad = cv2.approxPolyDP(hull, 0.025 * cv2.arcLength(hull, True), True)
         if len(quad) != 4 or not cv2.isContourConvex(quad):
             continue
-        polygon = np.zeros(gray.shape, np.uint8)
-        cv2.fillConvexPoly(polygon, quad, 255)
-        count = np.count_nonzero(polygon)
-        brown_fraction = np.count_nonzero((brown > 0) & (polygon > 0)) / count
-        black_fraction = np.count_nonzero((black > 0) & (polygon > 0)) / count
-        if brown_fraction < 0.12 or black_fraction < 0.02 or brown_fraction + black_fraction < 0.55:
+        region = np.zeros(mask.shape, np.uint8)
+        cv2.fillConvexPoly(region, quad, 255)
+        if np.count_nonzero((brown > 0) & (region > 0)) < 0.25 * np.count_nonzero(region):
             continue
-        moments = cv2.moments(quad)
+        corners = quad.reshape(4, 2).astype(np.float64) / scale
+        moments = cv2.moments(corners.astype(np.float32))
         pixel = np.array([moments['m10'] / moments['m00'], moments['m01'] / moments['m00']])
-        corners = quad.reshape(4, 2).astype(np.float64)
-        # Clockwise in image coordinates, starting at the top-left convention.
         angles = np.arctan2(corners[:, 1]-pixel[1], corners[:, 0]-pixel[0])
         corners = corners[np.argsort(angles)]
         corners = np.roll(corners, -np.argmin(corners.sum(axis=1)), axis=0)
+        polygon = np.zeros(bgr.shape[:2], np.uint8)
+        cv2.fillConvexPoly(polygon, np.rint(corners).astype(np.int32), 255)
         return corners, pixel, polygon
     return None
 
 
 def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
-                    minimum_area=1200., depth_tolerance=0.04, reprojection_limit=4.):
-    detection = detect_face(bgr, hsv_low, hsv_high, minimum_area)
+                    minimum_area=1200., depth_tolerance=0.04, reprojection_limit=4., detection=None):
+    detection = detection if detection is not None else detect_face(bgr, hsv_low, hsv_high, minimum_area)
     if detection is None:
         return None
     corners, pixel, polygon = detection
@@ -105,7 +105,7 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     sample_z = depth[yy[indices], xx[indices]]
     samples = np.column_stack([rays * sample_z[:, None], sample_z])
     best = None
-    for shift in range(4):
+    for shift in range(2):  # 180-degree alternatives are symmetry-equivalent.
         image_points = np.ascontiguousarray(np.roll(corners, shift, axis=0))
         result = cv2.solvePnPGeneric(object_points, image_points, k, distortion, flags=cv2.SOLVEPNP_IPPE)
         if not result[0]:
@@ -130,6 +130,12 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     if best is None:
         return None
     normal = best[2][:, 2]
+    # Refine range with measured depth after validating the known face dimensions.
+    # Brown segmentation can sit just inside a dark border; do not let that
+    # small corner-size error bias the otherwise directly measured depth.
+    face_center = best[1] - normal * thickness/2
+    depth_correction = normal * np.median((samples-face_center) @ normal)
+    best = (best[0], best[1] + depth_correction, best[2])
     face_center = best[1] - normal * thickness/2
     corner_rays = cv2.undistortPoints(corners.reshape(-1, 1, 2), k, distortion).reshape(-1, 2)
     corner_rays = np.column_stack([corner_rays, np.ones(4)])
@@ -154,7 +160,7 @@ class Perception(Node):
             'publish_mount_tf': True, 'mount_xyz': [0.24, -0.01, 0.55],
             'mount_rpy': [0.0, 0.0, 0.0],
             'box_dimensions': [0.42, 0.32, 0.055],
-            'brown_hsv_low': [5, 40, 25], 'brown_hsv_high': [35, 255, 255],
+            'brown_hsv_low': [0, 25, 20], 'brown_hsv_high': [40, 255, 255],
             'min_contour_area': 1200.0, 'sync_slop': 0.04,
             'processing_rate_hz': 3.0,
             'depth_tolerance': 0.04, 'max_reprojection_error': 4.0}
@@ -204,15 +210,23 @@ class Perception(Node):
         self.debug_pub = self.create_publisher(CompressedImage, '/perception/debug/compressed', qos_profile_sensor_data)
         self.rgb_sub = message_filters.Subscriber(self, Image, p['rgb_topic'], qos_profile=qos_profile_sensor_data)
         self.depth_sub = message_filters.Subscriber(self, Image, p['depth_topic'], qos_profile=qos_profile_sensor_data)
-        self.info_sub = message_filters.Subscriber(self, CameraInfo, p['info_topic'], qos_profile=qos_profile_sensor_data)
+        self.camera_info = None
+        self.info_sub = self.create_subscription(CameraInfo, p['info_topic'], self.info_callback, qos_profile_sensor_data)
         self.sync = message_filters.ApproximateTimeSynchronizer(
-            [self.rgb_sub, self.depth_sub, self.info_sub], queue_size=5, slop=p['sync_slop'])
+            [self.rgb_sub, self.depth_sub], queue_size=2, slop=p['sync_slop'])
         self.latest_frames = None
-        self.sync.registerCallback(self.queue_frames)
+        self.sync.registerCallback(self.queue_rgbd)
         self.create_timer(1.0 / rate, self.process_latest)
         self.last_warning = -float('inf')
         self.get_logger().info(
             f'Perception at up to {rate:g} Hz; run on the robot so raw RGB/depth stay local.')
+
+    def info_callback(self, info):
+        self.camera_info = info
+
+    def queue_rgbd(self, rgb, depth_msg):
+        if self.camera_info is not None:
+            self.queue_frames(rgb, depth_msg, self.camera_info)
 
     def queue_frames(self, rgb, depth_msg, info):
         self.latest_frames = (rgb, depth_msg, info)
@@ -242,11 +256,17 @@ class Perception(Node):
                 raise ValueError('Invalid camera intrinsics')
             bgr = self.bridge.imgmsg_to_cv2(rgb, 'bgr8')
             depth = depth_in_meters(self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough'), depth_msg.encoding)
+            detection = detect_face(bgr, self.values['brown_hsv_low'], self.values['brown_hsv_high'],
+                                    self.values['min_contour_area'])
+            if detection is None:
+                self.warn('No brown rectangular target found; check lighting and brown_hsv_low/high')
+                return
             result = estimate_target(bgr, depth, k, distortion, self.dimensions,
                                      self.values['brown_hsv_low'], self.values['brown_hsv_high'],
                                      self.values['min_contour_area'], self.values['depth_tolerance'],
-                                     self.values['max_reprojection_error'])
+                                     self.values['max_reprojection_error'], detection=detection)
             if result is None:
+                self.warn('Brown target found, but depth or known-face pose validation failed')
                 return  # RViz markers expire after 0.5 s; no stale pose is republished.
             point = PointStamped(header=rgb.header)
             point.point.x, point.point.y, point.point.z = map(float, result['surface'])
