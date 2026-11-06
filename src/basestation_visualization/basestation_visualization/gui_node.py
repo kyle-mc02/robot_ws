@@ -2,11 +2,13 @@
 
 import sys
 import time
+import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import CompressedImage, PointCloud2, Imu
-from geometry_msgs.msg import Twist
+from sensor_msgs.msg import CompressedImage, PointCloud2, Imu, CameraInfo
+from geometry_msgs.msg import Twist, PoseStamped
+from visualization_msgs.msg import MarkerArray, Marker
 from std_msgs.msg import String
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
@@ -29,6 +31,11 @@ class BasestationNode(Node):
         self.angular_speed = 0.0
         self.imu = None
         self.last_imu_time = float('-inf')
+        self.camera_info = None
+        self.detected_center = None
+        self.detected_contour = None
+        self.detected_pose = None
+        self.last_detection_time = float('-inf')
 
         video_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -42,14 +49,99 @@ class BasestationNode(Node):
         self.create_subscription(PointCloud2, '/reduced_lidar_points', self.lidar_callback, video_qos)
         self.create_subscription(Imu, '/camera/camera/imu', self.imu_callback, video_qos)
         
+        # Small metadata messages annotate the existing compressed video locally.
+        self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.camera_info_callback, video_qos)
+        self.create_subscription(MarkerArray, '/perception/markers', self.detection_markers_callback, video_qos)
+        self.create_subscription(PoseStamped, '/perception/box_pose', self.detection_pose_callback, video_qos)
+
         # Publisher for Mission Control
         self.mission_pub = self.create_publisher(String, '/mission_control', 10)
 
     def image_callback(self, msg):
         try:
-            self.latest_cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
+            frame = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
+            self.draw_detection_overlay(frame, msg.header)
+            self.latest_cv_image = frame
         except Exception as e:
             self.get_logger().warning(f"Camera decode failed: {e}")
+
+    def camera_info_callback(self, msg):
+        self.camera_info = msg
+
+    def detection_markers_callback(self, msg):
+        self.detected_center = None
+        self.detected_contour = None
+        for marker in msg.markers:
+            if marker.action != Marker.ADD:
+                continue
+            if marker.ns == 'box_center_camera':
+                self.detected_center = marker
+            elif marker.ns == 'detected_contour':
+                self.detected_contour = marker
+
+    def detection_pose_callback(self, msg):
+        self.detected_pose = msg
+        self.last_detection_time = time.monotonic()
+
+    @staticmethod
+    def stamp_seconds(header):
+        return header.stamp.sec + header.stamp.nanosec * 1e-9
+
+    def draw_detection_overlay(self, frame, image_header):
+        """Overlay fresh perception metadata on the original camera stream."""
+        pose, point, info = self.detected_pose, self.detected_center, self.camera_info
+        fresh_pose = (pose is not None and time.monotonic()-self.last_detection_time < 0.4
+                      and abs(self.stamp_seconds(pose.header)-self.stamp_seconds(image_header)) < 0.25)
+        lines = ['Object: unavailable / stale']
+        if fresh_pose:
+            position, q = pose.pose.position, pose.pose.orientation
+            xyz = np.array([position.x, position.y, position.z])
+            quat = np.array([q.x, q.y, q.z, q.w])
+            valid_pose = np.isfinite(xyz).all() and np.isfinite(quat).all() and np.linalg.norm(quat) > 1e-8
+            if valid_pose:
+                x, y, z, w = quat / np.linalg.norm(quat)
+                roll = math.atan2(2*(w*x+y*z), 1-2*(x*x+y*y))
+                pitch = math.asin(float(np.clip(2*(w*y-z*x), -1, 1)))
+                yaw = math.atan2(2*(w*z+x*y), 1-2*(y*y+z*z))
+                rpy = np.degrees([roll, pitch, yaw])
+                lines = [f'Box center distance ({pose.header.frame_id}): {np.linalg.norm(xyz):.2f} m',
+                         f'XYZ: {xyz[0]:+.2f}, {xyz[1]:+.2f}, {xyz[2]:+.2f} m',
+                         f'RPY: {rpy[0]:+.1f}, {rpy[1]:+.1f}, {rpy[2]:+.1f} deg']
+                # Project the same box center used by the distance report, plus its contour.
+                if (point is not None and info is not None
+                        and point.header.frame_id == image_header.frame_id == info.header.frame_id
+                        and abs(self.stamp_seconds(point.header)-self.stamp_seconds(pose.header)) < 0.05
+                        and (info.width, info.height) == (frame.shape[1], frame.shape[0])):
+                    center = point.pose.position
+                    xyz_camera = np.array([center.x, center.y, center.z], np.float64)
+                    k = np.asarray(info.k, np.float64).reshape(3, 3)
+                    distortion = np.asarray(info.d, np.float64)
+                    if (info.distortion_model in ('plumb_bob', 'rational_polynomial')
+                            and np.isfinite(xyz_camera).all() and xyz_camera[2] > 0
+                            and np.isfinite(k).all() and np.isfinite(distortion).all()
+                            and k[0, 0] > 0 and k[1, 1] > 0):
+                        pixel, _ = cv2.projectPoints(xyz_camera[None], np.zeros(3), np.zeros(3), k, distortion)
+                        uv = pixel.ravel()
+                        if np.isfinite(uv).all() and 0 <= uv[0] < frame.shape[1] and 0 <= uv[1] < frame.shape[0]:
+                            u, v = np.rint(uv).astype(int)
+                            contour = self.detected_contour
+                            if (contour is not None and contour.header.frame_id == point.header.frame_id
+                                    and abs(self.stamp_seconds(contour.header)-self.stamp_seconds(point.header)) < 0.001
+                                    and len(contour.points) >= 4):
+                                corners = np.array([[p.x, p.y, p.z] for p in contour.points], np.float64)
+                                if np.isfinite(corners).all() and np.all(corners[:, 2] > 0):
+                                    outline, _ = cv2.projectPoints(corners, np.zeros(3), np.zeros(3), k, distortion)
+                                    if np.isfinite(outline).all():
+                                        outline = np.clip(outline.reshape(-1, 2), -10000, 10000).astype(np.int32)
+                                        cv2.polylines(frame, [outline], True, (0, 255, 0), 2)
+                            cv2.circle(frame, (u, v), 4, (0, 255, 255), -1)
+        scale, thickness = 0.48, 1
+        widths = [cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0] for line in lines]
+        panel_width = min(frame.shape[1]-1, max(widths)+20)
+        cv2.rectangle(frame, (5, 5), (panel_width, 12+22*len(lines)), (20, 20, 20), -1)
+        for index, line in enumerate(lines):
+            cv2.putText(frame, line, (10, 26+22*index), cv2.FONT_HERSHEY_SIMPLEX,
+                        scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
     def status_callback(self, msg):
         if msg.data.startswith('STATE:'):
