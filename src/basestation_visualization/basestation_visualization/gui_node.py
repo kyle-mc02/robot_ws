@@ -3,9 +3,11 @@
 import sys
 import time
 import math
+import threading
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
 from sensor_msgs.msg import CompressedImage, PointCloud2, Imu, CameraInfo
 from geometry_msgs.msg import Twist, PoseStamped
 from visualization_msgs.msg import MarkerArray, Marker
@@ -23,6 +25,7 @@ class BasestationNode(Node):
     def __init__(self):
         super().__init__('basestation_gui_node')
         self.bridge = CvBridge()
+        self.state_lock = threading.Lock()
         self.latest_cv_image = None
         self.latest_lidar_image = None
         self.mission_status = 'Waiting for robot'
@@ -70,7 +73,8 @@ class BasestationNode(Node):
         except Exception as e:
             # Perception metadata must never block otherwise valid video.
             self.get_logger().warning(f"Detection overlay failed: {e}")
-        self.latest_cv_image = frame
+        with self.state_lock:
+            self.latest_cv_image = frame
 
     def camera_info_callback(self, msg):
         self.camera_info = msg
@@ -171,7 +175,8 @@ class BasestationNode(Node):
 
     def status_callback(self, msg):
         if msg.data.startswith('STATE:'):
-            self.mission_status = msg.data[6:]
+            with self.state_lock:
+                self.mission_status = msg.data[6:]
 
     def lidar_callback(self, msg):
         # Sensor-frame projection, +/-10 m. Measured robot forward is down in this view.
@@ -199,16 +204,19 @@ class BasestationNode(Node):
         corner_max = (round((200+half_width)*256), round((200+half_length)*256))
         cv2.rectangle(image, corner_min, corner_max, (255, 255, 255), 1, shift=8)
         cv2.arrowedLine(image, (200, 198), (200, 204), (255, 255, 255), 1, tipLength=0.5)
-        self.latest_lidar_image = image
+        with self.state_lock:
+            self.latest_lidar_image = image
 
     def telemetry_callback(self, msg):
-        self.last_command_time = time.monotonic()
-        self.linear_speed = msg.linear.x
-        self.angular_speed = msg.angular.z
+        with self.state_lock:
+            self.last_command_time = time.monotonic()
+            self.linear_speed = msg.linear.x
+            self.angular_speed = msg.angular.z
         
     def imu_callback(self, msg):
-        self.imu = msg
-        self.last_imu_time = time.monotonic()
+        with self.state_lock:
+            self.imu = msg
+            self.last_imu_time = time.monotonic()
 
     def send_command(self, cmd):
         msg = String()
@@ -293,41 +301,48 @@ class BasestationGUI(QMainWindow):
 
         main_layout.addLayout(right_layout, stretch=1)
 
-        self.ros_timer = QTimer()
-        self.ros_timer.timeout.connect(self.spin_ros)
-        self.ros_timer.start(30)
+        self.display_timer = QTimer(self)
+        self.display_timer.timeout.connect(self.refresh_display)
+        self.display_timer.start(30)
 
-    def spin_ros(self):
-        # Drain enough callbacks for camera, commands, status and LiDAR.
-        for _ in range(5):
-            rclpy.spin_once(self.node, timeout_sec=0.0)
-        
-        if self.node.latest_cv_image is not None:
-            rgb_image = cv2.cvtColor(self.node.latest_cv_image, cv2.COLOR_BGR2RGB)
+    def refresh_display(self):
+        # Transfer references only; decoding, overlays and LiDAR run outside Qt.
+        # Clearing slots under the lock cannot discard a newly published frame.
+        with self.node.state_lock:
+            camera_image = self.node.latest_cv_image
+            image = self.node.latest_lidar_image
+            self.node.latest_cv_image = None
+            self.node.latest_lidar_image = None
+            last_command_time = self.node.last_command_time
+            mission_status = self.node.mission_status
+            linear_speed = self.node.linear_speed
+            angular_speed = self.node.angular_speed
+            imu = self.node.imu
+            last_imu_time = self.node.last_imu_time
+
+        if camera_image is not None:
+            rgb_image = cv2.cvtColor(camera_image, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
             qt_img = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888)
             self.video_label.setPixmap(QPixmap.fromImage(qt_img).scaled(self.video_label.size(), Qt.KeepAspectRatio))
-            self.node.latest_cv_image = None
-            
-        if self.node.latest_lidar_image is not None:
-            image = self.node.latest_lidar_image
+
+        if image is not None:
             qt_image = QImage(image.data, 401, 401, image.strides[0], QImage.Format_RGB888)
             self.lidar_label.setPixmap(QPixmap.fromImage(qt_image).scaled(
                 self.lidar_label.size(), Qt.KeepAspectRatio))
-            self.node.latest_lidar_image = None
-        connected = time.monotonic() - self.node.last_command_time < 1.0
-        self.status_label.setText(self.node.mission_status if connected else 'Robot commands unavailable')
+        connected = time.monotonic() - last_command_time < 1.0
+        self.status_label.setText(mission_status if connected else 'Robot commands unavailable')
         if not connected:
-            self.node.linear_speed = 0.0
-            self.node.angular_speed = 0.0
-        self.linear_label.setText(f"Requested Linear (m/s): {self.node.linear_speed:.2f}")
-        self.requested_angular_label.setText(f"Requested Angular (rad/s): {self.node.angular_speed:.2f}")
-        if time.monotonic() - self.node.last_imu_time < 1.0:
-            gyro = self.node.imu.angular_velocity
-            accel = self.node.imu.linear_acceleration
+            linear_speed = 0.0
+            angular_speed = 0.0
+        self.linear_label.setText(f"Requested Linear (m/s): {linear_speed:.2f}")
+        self.requested_angular_label.setText(f"Requested Angular (rad/s): {angular_speed:.2f}")
+        if imu is not None and time.monotonic() - last_imu_time < 1.0:
+            gyro = imu.angular_velocity
+            accel = imu.linear_acceleration
             self.angular_label.setText(f"Gyro x/y/z (rad/s): {gyro.x:.2f}, {gyro.y:.2f}, {gyro.z:.2f}")
             self.accel_label.setText(f"Accel x/y/z (m/s², incl. gravity): {accel.x:.2f}, {accel.y:.2f}, {accel.z:.2f}")
-            self.imu_frame_label.setText(f"IMU frame: {self.node.imu.header.frame_id}")
+            self.imu_frame_label.setText(f"IMU frame: {imu.header.frame_id}")
         else:
             self.angular_label.setText("IMU gyro: unavailable")
             self.accel_label.setText("IMU acceleration: unavailable")
@@ -339,10 +354,20 @@ def main():
     node = BasestationNode()
     app = QApplication(sys.argv)
     gui = BasestationGUI(node)
-    gui.show()
-    app.exec_()
-    node.destroy_node()
-    rclpy.shutdown()
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    ros_thread = threading.Thread(target=executor.spin, name='basestation-ros')
+    ros_thread.start()
+    try:
+        gui.show()
+        app.exec_()
+    finally:
+        gui.display_timer.stop()
+        # Finish callbacks before destroying their node and publishers.
+        executor.shutdown()
+        ros_thread.join()
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
