@@ -43,7 +43,7 @@ def deproject(pixel, z, k, distortion):
     return np.array([ray[0] * z, ray[1] * z, z])
 
 
-def detect_face(bgr, hsv_low, hsv_high, minimum_area):
+def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None):
     """Return image corners, centroid, and (local mask, x offset, y offset).
 
     Brown-first segmentation; dark stripes are allowed, never required.
@@ -57,6 +57,7 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area):
     mask = cv2.morphologyEx(brown, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     ranked = ((cv2.contourArea(contour), index) for index, contour in enumerate(contours))
+    rejected_corners = False
     for area, index in heapq.nlargest(10, ranked, key=lambda item: item[0]):
         contour = contours[index]
         if area < minimum_area * scale**2 or area > small.shape[0] * small.shape[1] * 0.9:
@@ -64,7 +65,8 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area):
         hull = cv2.convexHull(contour)
         quad = cv2.approxPolyDP(hull, 0.025 * cv2.arcLength(hull, True), True)
         if len(quad) != 4 or not cv2.isContourConvex(quad):
-            quad = cv2.boxPoints(cv2.minAreaRect(hull)).astype(np.int32).reshape(4, 1, 2)
+            rejected_corners = True
+            continue
         x, y, w, h = cv2.boundingRect(quad)
         x0, y0 = max(0, x), max(0, y)
         x1, y1 = min(mask.shape[1], x+w), min(mask.shape[0], y+h)
@@ -92,6 +94,9 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area):
         cv2.fillConvexPoly(polygon, integer_corners - np.array([x0, y0], np.int32), 255)
         # Keep image-space corners/center, but allocate only a target-local mask.
         return corners, pixel, (polygon, x0, y0)
+    if rejected_corners and warn is not None:
+        warn('Pose unavailable: could not identify four perspective face corners '
+             '(minimum-area rectangle fallback disabled)')
     return None
 
 
@@ -104,7 +109,7 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
             warn(f'Pose rejected: {reason}')
         return None
 
-    detection = detection if detection is not None else detect_face(bgr, hsv_low, hsv_high, minimum_area)
+    detection = detection if detection is not None else detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=warn)
     if detection is None:
         return reject('no brown rectangular face detected')
     corners, pixel, (polygon, x0, y0) = detection
@@ -283,7 +288,7 @@ class Perception(Node):
         try:
             bgr = self.bridge.compressed_imgmsg_to_cv2(rgb, 'bgr8')
             detection = detect_face(bgr, self.values['brown_hsv_low'], self.values['brown_hsv_high'],
-                                    self.values['min_contour_area'])
+                                    self.values['min_contour_area'], warn=self.warn)
             info = self.camera_info
             if detection is None:
                 self.marker_pub.publish(MarkerArray(markers=[Marker(
@@ -345,7 +350,7 @@ class Perception(Node):
             depth = depth_in_meters(self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough'), depth_msg.encoding)
             if detection is None:
                 detection = detect_face(bgr, self.values['brown_hsv_low'], self.values['brown_hsv_high'],
-                                        self.values['min_contour_area'])
+                                        self.values['min_contour_area'], warn=self.warn)
             if detection is None:
                 self.warn('No brown rectangular target found; check lighting and brown_hsv_low/high')
                 return
