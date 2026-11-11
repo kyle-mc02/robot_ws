@@ -96,10 +96,17 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area):
 
 
 def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
-                    minimum_area=1200., depth_tolerance=0.04, reprojection_limit=4., detection=None):
+                    minimum_area=1200., depth_tolerance=0.04, reprojection_limit=4., detection=None,
+                    warn=None):
+    """Estimate a pose; report rejection details through an optional warning callback."""
+    def reject(reason):
+        if warn is not None:
+            warn(f'Pose rejected: {reason}')
+        return None
+
     detection = detection if detection is not None else detect_face(bgr, hsv_low, hsv_high, minimum_area)
     if detection is None:
-        return None
+        return reject('no brown rectangular face detected')
     corners, pixel, (polygon, x0, y0) = detection
     depth_roi = depth[y0:y0+polygon.shape[0], x0:x0+polygon.shape[1]]
     u, v = np.rint(pixel).astype(int)
@@ -108,7 +115,8 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     mask = polygon[max(0, v-3):v+4, max(0, u-3):u+4] > 0
     valid = mask & np.isfinite(patch) & (patch > 0.1) & (patch < 10.)
     if np.count_nonzero(valid) < 5:
-        return None
+        return reject(f'center depth patch has {np.count_nonzero(valid)} valid pixels; '
+                      'need >=5 finite depths between 0.1 and 10 m')
     z = float(np.median(patch[valid]))
     surface = deproject(pixel, z, k, distortion)
     width, height, thickness = dimensions
@@ -126,37 +134,49 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     valid = (eroded[yy, xx] > 0) & np.isfinite(candidate_z) & (candidate_z > 0.1) & (candidate_z < 10.)
     xx, yy = xx[valid], yy[valid]
     if len(xx) < 20:
-        return None
+        return reject(f'interior depth grid has {len(xx)} valid samples; need >=20 '
+                      f'(checked {candidate_z.size} grid locations)')
     indices = np.linspace(0, len(xx)-1, min(150, len(xx)), dtype=int)
     samples_uv = np.column_stack([xx[indices]+x0, yy[indices]+y0]).astype(np.float64)
     rays = cv2.undistortPoints(samples_uv.reshape(-1, 1, 2), k, distortion).reshape(-1, 2)
     sample_z = depth_roi[yy[indices], xx[indices]]
     samples = np.column_stack([rays * sample_z[:, None], sample_z])
     best = None
+    rejections = []
     for shift in range(2):  # 180-degree alternatives are symmetry-equivalent.
         image_points = np.ascontiguousarray(np.roll(corners, shift, axis=0))
         result = cv2.solvePnPGeneric(object_points, image_points, k, distortion, flags=cv2.SOLVEPNP_IPPE)
         if not result[0]:
+            rejections.append(f'corner shift {shift}: PnP returned no solutions')
             continue
-        for rvec, tvec in zip(result[1], result[2]):
+        for candidate, (rvec, tvec) in enumerate(zip(result[1], result[2])):
+            label = f'shift {shift}, candidate {candidate}'
             rotation, _ = cv2.Rodrigues(rvec)
             translation = tvec.ravel()
             normal = rotation[:, 2]
             if translation[2] <= 0 or np.dot(normal, translation) <= 0:
+                rejections.append(f'{label}: invalid face direction / behind camera '
+                                  f'(z={translation[2]:.3f} m, normal dot position={np.dot(normal, translation):.3f})')
                 continue
             projected, _ = cv2.projectPoints(object_points, rvec, tvec, k, distortion)
             error = float(np.sqrt(np.mean(np.sum((projected.reshape(-1, 2)-image_points)**2, axis=1))))
             plane_error = float(np.median(np.abs((samples-translation) @ normal)))
             if error > reprojection_limit or plane_error > depth_tolerance:
+                rejections.append(f'{label}: reprojection={error:.2f} px '
+                                  f'(limit {reprojection_limit:.2f}), plane depth error={plane_error:.4f} m '
+                                  f'(limit {depth_tolerance:.4f})')
                 continue
-            if abs(np.dot(surface-translation, normal)) > depth_tolerance:
+            center_error = float(abs(np.dot(surface-translation, normal)))
+            if center_error > depth_tolerance:
+                rejections.append(f'{label}: center depth error={center_error:.4f} m '
+                                  f'(limit {depth_tolerance:.4f})')
                 continue
             # Stable image-corner convention breaks indistinguishable symmetry ties.
             score = error + 100 * plane_error
             if best is None or score < best[0] - 1e-6:
                 best = (score, translation + normal * thickness/2, rotation)
     if best is None:
-        return None
+        return reject('no valid PnP pose; ' + '; '.join(rejections))
     normal = best[2][:, 2]
     # Refine range with measured depth after validating the known face dimensions.
     # Brown segmentation can sit just inside a dark border; do not let that
@@ -169,10 +189,10 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     corner_rays = np.column_stack([corner_rays, np.ones(4)])
     denominator = corner_rays @ normal
     if np.any(np.abs(denominator) < 1e-6):
-        return None
+        return reject('corner viewing ray is nearly parallel to the estimated face plane')
     corner_depths = np.dot(face_center, normal) / denominator
     if np.any(corner_depths <= 0):
-        return None
+        return reject(f'estimated face corners lie behind camera: depths={corner_depths.tolist()} m')
     corners_camera = corner_rays * corner_depths[:, None]
     return {'corners_camera': corners_camera, 'pixel': pixel, 'surface': surface, 'center': best[1], 'rotation': best[2], 'corners': corners}
 
@@ -332,9 +352,9 @@ class Perception(Node):
             result = estimate_target(bgr, depth, k, distortion, self.dimensions,
                                      self.values['brown_hsv_low'], self.values['brown_hsv_high'],
                                      self.values['min_contour_area'], self.values['depth_tolerance'],
-                                     self.values['max_reprojection_error'], detection=detection)
+                                     self.values['max_reprojection_error'], detection=detection,
+                                     warn=self.warn)
             if result is None:
-                self.warn('Brown target found, but depth or known-face pose validation failed')
                 return  # RViz markers expire after 0.5 s; no stale pose is republished.
             point = PointStamped(header=rgb.header)
             point.point.x, point.point.y, point.point.z = map(float, result['surface'])
