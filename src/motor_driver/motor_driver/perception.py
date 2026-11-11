@@ -5,6 +5,7 @@ Box axes: x along the 42 cm face edge, y along the 32 cm edge, z into the
 has a 180-degree ambiguity; this is not a uniquely identified object frame.
 """
 import math
+import heapq
 
 import cv2
 import numpy as np
@@ -43,7 +44,10 @@ def deproject(pixel, z, k, distortion):
 
 
 def detect_face(bgr, hsv_low, hsv_high, minimum_area):
-    """Brown-first segmentation; dark stripes are allowed, never required."""
+    """Return image corners, centroid, and (local mask, x offset, y offset).
+
+    Brown-first segmentation; dark stripes are allowed, never required.
+    """
     # Work at <=320 px width rather than running Canny across every full RGB frame.
     scale = min(1.0, 320.0 / bgr.shape[1])
     small = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else bgr
@@ -52,27 +56,42 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area):
     # Reconnect brown regions split by black lines; fill internal stripe gaps.
     mask = cv2.morphologyEx(brown, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:10]:
-        area = cv2.contourArea(contour)
+    ranked = ((cv2.contourArea(contour), index) for index, contour in enumerate(contours))
+    for area, index in heapq.nlargest(10, ranked, key=lambda item: item[0]):
+        contour = contours[index]
         if area < minimum_area * scale**2 or area > small.shape[0] * small.shape[1] * 0.9:
             continue
         hull = cv2.convexHull(contour)
         quad = cv2.approxPolyDP(hull, 0.025 * cv2.arcLength(hull, True), True)
         if len(quad) != 4 or not cv2.isContourConvex(quad):
             quad = cv2.boxPoints(cv2.minAreaRect(hull)).astype(np.int32).reshape(4, 1, 2)
-        region = np.zeros(mask.shape, np.uint8)
-        cv2.fillConvexPoly(region, quad, 255)
-        if np.count_nonzero((brown > 0) & (region > 0)) < 0.25 * np.count_nonzero(region):
+        x, y, w, h = cv2.boundingRect(quad)
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(mask.shape[1], x+w), min(mask.shape[0], y+h)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        region = np.zeros((y1-y0, x1-x0), np.uint8)
+        cv2.fillConvexPoly(region, quad - np.array([x0, y0], np.int32), 255)
+        if np.count_nonzero((brown[y0:y1, x0:x1] > 0) & (region > 0)) < 0.25 * np.count_nonzero(region):
             continue
         corners = quad.reshape(4, 2).astype(np.float64) / scale
         moments = cv2.moments(corners.astype(np.float32))
+        if abs(moments['m00']) < 1e-8:
+            continue
         pixel = np.array([moments['m10'] / moments['m00'], moments['m01'] / moments['m00']])
         angles = np.arctan2(corners[:, 1]-pixel[1], corners[:, 0]-pixel[0])
         corners = corners[np.argsort(angles)]
         corners = np.roll(corners, -np.argmin(corners.sum(axis=1)), axis=0)
-        polygon = np.zeros(bgr.shape[:2], np.uint8)
-        cv2.fillConvexPoly(polygon, np.rint(corners).astype(np.int32), 255)
-        return corners, pixel, polygon
+        integer_corners = np.rint(corners).astype(np.int32)
+        x, y, w, h = cv2.boundingRect(integer_corners)
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(bgr.shape[1], x+w), min(bgr.shape[0], y+h)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        polygon = np.zeros((y1-y0, x1-x0), np.uint8)
+        cv2.fillConvexPoly(polygon, integer_corners - np.array([x0, y0], np.int32), 255)
+        # Keep image-space corners/center, but allocate only a target-local mask.
+        return corners, pixel, (polygon, x0, y0)
     return None
 
 
@@ -81,9 +100,11 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     detection = detection if detection is not None else detect_face(bgr, hsv_low, hsv_high, minimum_area)
     if detection is None:
         return None
-    corners, pixel, polygon = detection
+    corners, pixel, (polygon, x0, y0) = detection
+    depth_roi = depth[y0:y0+polygon.shape[0], x0:x0+polygon.shape[1]]
     u, v = np.rint(pixel).astype(int)
-    patch = depth[max(0, v-3):v+4, max(0, u-3):u+4]
+    u, v = u-x0, v-y0
+    patch = depth_roi[max(0, v-3):v+4, max(0, u-3):u+4]
     mask = polygon[max(0, v-3):v+4, max(0, u-3):u+4] > 0
     valid = mask & np.isfinite(patch) & (patch > 0.1) & (patch < 10.)
     if np.count_nonzero(valid) < 5:
@@ -94,14 +115,22 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     object_points = np.array([[-width/2, -height/2, 0], [width/2, -height/2, 0],
                               [width/2, height/2, 0], [-width/2, height/2, 0]], np.float64)
     # Interior RGB-D surface samples disambiguate planar PnP solutions.
-    eroded = cv2.erode(polygon, np.ones((7, 7), np.uint8))
-    yy, xx = np.nonzero((eroded > 0) & np.isfinite(depth) & (depth > 0.1) & (depth < 10.))
+    eroded = cv2.erode(polygon, np.ones((7, 7), np.uint8),
+                       borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    # Validate at most 32x32 evenly distributed candidates instead of scanning
+    # every depth pixel and building potentially huge coordinate arrays.
+    grid_x = np.linspace(0, polygon.shape[1]-1, min(32, polygon.shape[1]), dtype=int)
+    grid_y = np.linspace(0, polygon.shape[0]-1, min(32, polygon.shape[0]), dtype=int)
+    xx, yy = np.meshgrid(grid_x, grid_y)
+    candidate_z = depth_roi[yy, xx]
+    valid = (eroded[yy, xx] > 0) & np.isfinite(candidate_z) & (candidate_z > 0.1) & (candidate_z < 10.)
+    xx, yy = xx[valid], yy[valid]
     if len(xx) < 20:
         return None
     indices = np.linspace(0, len(xx)-1, min(150, len(xx)), dtype=int)
-    samples_uv = np.column_stack([xx[indices], yy[indices]]).astype(np.float64)
+    samples_uv = np.column_stack([xx[indices]+x0, yy[indices]+y0]).astype(np.float64)
     rays = cv2.undistortPoints(samples_uv.reshape(-1, 1, 2), k, distortion).reshape(-1, 2)
-    sample_z = depth[yy[indices], xx[indices]]
+    sample_z = depth_roi[yy[indices], xx[indices]]
     samples = np.column_stack([rays * sample_z[:, None], sample_z])
     best = None
     for shift in range(2):  # 180-degree alternatives are symmetry-equivalent.
