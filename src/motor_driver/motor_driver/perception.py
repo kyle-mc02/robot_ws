@@ -62,13 +62,41 @@ def ordered_corners(corners):
     return np.roll(corners, -np.argmin(corners.sum(axis=1)), axis=0)
 
 
+def fit_outer_edges(contour, seed, offset):
+    box=cv2.boxPoints(cv2.minAreaRect(seed)).astype(float)
+    center=box.mean(0)-offset
+    u=box[1]-box[0];w=np.linalg.norm(u);u/=w
+    v=box[2]-box[1];h=np.linalg.norm(v);v/=h
+    axes=np.column_stack([u,v]);pts=contour.reshape(-1,2).astype(float);coords=(pts-center)@axes
+    lines=[]
+    for axis,sign in [(0,-1),(1,-1),(0,1),(1,1)]:
+        other=1-axis;extent=[w,h][other]
+        band=(np.abs(coords[:,other])<extent*.35) & (coords[:,axis]*sign > [w,h][axis]*.48)
+        subset=pts[band]; values=coords[band,axis]
+        if len(values)<5:return
+        bins=np.floor(values).astype(int);offset_bin=bins.min();hist=np.bincount(bins-offset_bin);counts=np.convolve(hist,np.ones(5),mode="same");edge=float(np.argmax(counts)+offset_bin)
+        selected=subset[np.abs(values-edge)<2]
+        if len(selected)<5:return
+        if np.ptp((selected-center)@axes[:,other])<extent*.3:return
+        vx,vy,x,y=cv2.fitLine(selected.astype(np.float32),cv2.DIST_HUBER,0,.01,.01).ravel()
+        lines.append((np.array([vx,vy]),np.array([x,y])))
+    corners=[]
+    for a,b in [(0,1),(1,2),(2,3),(3,0)]:
+        da,pa=lines[a];db,pb=lines[b];mat=np.column_stack([da,-db])
+        if abs(np.linalg.det(mat))<.1:return
+        corner=pa+np.linalg.solve(mat,pb-pa)[0]*da;corners.append(corner+offset)
+    return np.array(corners)
+
+
+
 def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None):
     """HSV locates brown; recover surrounding dark borders in a small local ROI."""
     scale = min(1.0, 320.0 / bgr.shape[1])
     small = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else bgr
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     brown = cv2.inRange(hsv, np.array(hsv_low, np.uint8), np.array(hsv_high, np.uint8))
-    mask = cv2.morphologyEx(brown, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    mask = cv2.morphologyEx(brown, cv2.MORPH_OPEN, np.ones((3,3),np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5),np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     ranked = ((cv2.contourArea(c), i) for i, c in enumerate(contours))
     for area, index in heapq.nlargest(10, ranked, key=lambda item: item[0]):
@@ -76,7 +104,7 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None):
             continue
         seed = contours[index]
         x, y, w, h = cv2.boundingRect(seed)
-        pad = max(5, int(min(w,h)*0.3))
+        pad = max(5, int(min(w,h)*0.25))
         x0, y0 = max(0,x-pad), max(0,y-pad)
         x1, y1 = min(small.shape[1],x+w+pad), min(small.shape[0],y+h+pad)
         roi = hsv[y0:y1,x0:x1]
@@ -95,17 +123,33 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None):
             for epsilon in (0.015,0.025,0.04):
                 quad = cv2.approxPolyDP(hull,epsilon*cv2.arcLength(hull,True),True)
                 if len(quad)==4 and cv2.isContourConvex(quad):
-                    candidates.append((cv2.contourArea(quad),quad.reshape(4,2)+[x0,y0]))
+                    global_quad=quad.reshape(4,2)+[x0,y0]
+                    if (np.any(global_quad[:,0]<=1) or np.any(global_quad[:,1]<=1)
+                            or np.any(global_quad[:,0]>=small.shape[1]-2) or np.any(global_quad[:,1]>=small.shape[0]-2)):
+                        continue  # Image-clipped/background contours cannot supply four face corners.
+                    candidates.append((cv2.contourArea(quad),global_quad))
                     break
         pose_corners = None
         if candidates:
             pose_corners = ordered_corners(max(candidates,key=lambda q:q[0])[1]/scale)
             corners = pose_corners
         else:
+            edges = cv2.Canny(cv2.cvtColor(small[y0:y1,x0:x1],cv2.COLOR_BGR2GRAY),40,100)
+            edge_points = cv2.findNonZero(edges)
+            fitted = fit_outer_edges(edge_points,seed,np.array([x0,y0])) if edge_points is not None else None
+            if fitted is not None:
+                candidate = ordered_corners(fitted/scale)
+                if (np.isfinite(candidate).all() and cv2.isContourConvex(candidate.astype(np.float32))
+                        and cv2.contourArea(candidate.astype(np.float32)) < area/scale**2*2.0):
+                    pose_corners = candidate
+            corners = pose_corners if pose_corners is not None else ordered_corners(cv2.boxPoints(cv2.minAreaRect(seed))/scale)
+        if pose_corners is None:
             # Detection survives irregular contours; never feed synthetic rectangle
             # corners to PnP as if they were physical perspective corners.
             corners = ordered_corners(cv2.boxPoints(cv2.minAreaRect(seed))/scale)
-        pixel = corners.mean(axis=0)
+        homography = cv2.getPerspectiveTransform(
+            np.array([[0,0],[1,0],[1,1],[0,1]],np.float32),corners.astype(np.float32))
+        pixel = cv2.perspectiveTransform(np.array([[[0.5,0.5]]],np.float32),homography)[0,0].astype(np.float64)
         integer = np.rint(corners).astype(np.int32)
         rx,ry,rw,rh = cv2.boundingRect(integer)
         rx,ry = max(0,rx),max(0,ry)
@@ -235,7 +279,37 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
             if best is None or score < best[0] - 1e-6:
                 best = (score, translation + normal * thickness/2, rotation)
     if best is None:
-        return reject('no valid PnP pose; ' + '; '.join(rejections))
+        # RGB-D alternative: intersect true image corners with the measured plane.
+        # Validate physical edge lengths and orthogonality, instead of weakening PnP.
+        xy=cv2.undistortPoints(corners.reshape(-1,1,2),k,distortion).reshape(-1,2)
+        rays=np.column_stack([xy,np.ones(4)])
+        denom=rays@measured_normal
+        if np.any(denom<=1e-6):
+            return reject('face-corner rays are inconsistent with depth plane')
+        depths=(measured_center@measured_normal)/denom
+        xyz=rays*depths[:,None]
+        lengths=np.linalg.norm(np.roll(xyz,-1,axis=0)-xyz,axis=1)
+        for shift in range(2):
+            pts=np.roll(xyz,shift,axis=0)
+            edge_x=((pts[1]-pts[0])+(pts[2]-pts[3]))/2
+            edge_y=((pts[3]-pts[0])+(pts[2]-pts[1]))/2
+            measured=np.array([np.linalg.norm(edge_x),np.linalg.norm(edge_y)])
+            if np.any(np.abs(measured/[width,height]-1)>0.10):
+                continue
+            if abs(np.dot(edge_x,edge_y)/np.prod(measured))>0.15:
+                continue
+            axis_x=edge_x/np.linalg.norm(edge_x)
+            axis_y=np.cross(measured_normal,axis_x)
+            axis_y/=np.linalg.norm(axis_y)
+            if axis_y@edge_y<0:
+                continue
+            rotation=np.column_stack([axis_x,axis_y,measured_normal])
+            center=xyz.mean(axis=0)+measured_normal*thickness/2
+            best=(0.,center,rotation)
+            break
+        if best is None:
+            return reject('PnP failed and measured face edges do not match known dimensions '
+                          f'(edges {np.round(lengths,3).tolist()} m); '+'; '.join(rejections))
     normal = best[2][:, 2]
     # Refine range with measured depth after validating the known face dimensions.
     # Brown segmentation can sit just inside a dark border; do not let that
