@@ -1,8 +1,9 @@
 """Brown/black rectangular-face RGB-D detection; independent of motor control.
 
 Box axes: x along the 42 cm face edge, y along the 32 cm edge, z into the
-5.5 cm thickness. Pose origin is the box center. A symmetric unmarked face
-has a 180-degree ambiguity; this is not a uniquely identified object frame.
+5.5 cm thickness. Pose origin is the box center. Broad, side and end faces
+share those axes. Unmarked faces cannot identify front/back or resolve every
+180-degree symmetry; orientation is a consistent geometric estimate.
 """
 import math
 import heapq
@@ -100,8 +101,33 @@ def foreground_depth_mask(brown, depth):
     peak=int(hist.argmax())
     near=(edges[peak]+edges[peak+1])/2
     band=valid&(np.abs(z-near)<max(.18,near*.12))
-    # Only bridge tiny missing-depth gaps, not depth jumps to other objects.
+    # A plane is linear in inverse depth. Refine the loose range band using
+    # only a small, deterministic sample, so nearby separate objects are removed
+    # while a slanted face can retain its legitimate depth gradient.
+    yy,xx=np.nonzero((brown>0)&band)
+    if len(xx)>=30:
+        ids=np.linspace(0,len(xx)-1,min(150,len(xx)),dtype=int)
+        x=xx[ids]/brown.shape[1];y=yy[ids]/brown.shape[0]
+        design=np.column_stack([x,y,np.ones(len(ids))]);sample=z[yy[ids],xx[ids]]
+        rng=np.random.default_rng(7);best=None;count=0
+        for _ in range(32):
+            chosen=rng.choice(len(sample),3,replace=False)
+            if abs(np.linalg.det(design[chosen]))<1e-6:continue
+            model=np.linalg.solve(design[chosen],1/sample[chosen])
+            inverse=design@model
+            predicted=np.divide(1.,inverse,out=np.full_like(inverse,np.inf),where=inverse>0)
+            inliers=np.abs(predicted-sample)<.025
+            if inliers.sum()>count:best=inliers;count=int(inliers.sum())
+        if best is not None and count>=max(25,int(.75*len(sample))):
+            model=np.linalg.lstsq(design[best],1/sample[best],rcond=None)[0]
+            gy,gx=np.indices(z.shape)
+            inverse=model[0]*gx/brown.shape[1]+model[1]*gy/brown.shape[0]+model[2]
+            predicted=np.divide(1.,inverse,out=np.full_like(inverse,np.inf),where=inverse>0)
+            band=valid&(np.abs(z-predicted)<.035)&(np.abs(z-near)<.55)
+    # One pixel at the reduced resolution covers RGB/depth edge registration.
+    # Select this band globally before applying any tracking crop.
     return cv2.dilate(band.astype(np.uint8),np.ones((3,3),np.uint8))>0
+
 
 
 def three_visible_edges(points, seed, offset):
@@ -138,12 +164,12 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None, depth=None, sea
     small = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else bgr
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     brown = cv2.inRange(hsv, np.array(hsv_low, np.uint8), np.array(hsv_high, np.uint8))
+    foreground=foreground_depth_mask(brown,depth) if depth is not None else None
     if search_region is not None:
         left,top,right,bottom=np.rint(np.asarray(search_region)*scale).astype(int)
         restricted=np.zeros_like(brown)
         restricted[top:bottom,left:right]=brown[top:bottom,left:right]
         brown=restricted
-    foreground=foreground_depth_mask(brown,depth) if depth is not None else None
     if foreground is not None:
         brown[~foreground]=0
     mask = cv2.morphologyEx(brown, cv2.MORPH_OPEN, np.ones((3,3),np.uint8))
@@ -450,12 +476,26 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     return {'corners_camera': corners_camera, 'pixel': pixel, 'surface': surface, 'center': best[1], 'rotation': best[2], 'corners': corners}
 
 
+def face_model(rotation,dimensions,kind):
+    """Visible-face axes expressed in the fixed physical box frame."""
+    width,height,thickness=dimensions
+    if kind=='side':
+        basis=np.array([[0,0,1],[0,1,0],[-1,0,0]],float)
+        return rotation@basis,np.array([thickness,height,width])
+    if kind=='end':
+        basis=np.array([[1,0,0],[0,0,1],[0,-1,0]],float)
+        return rotation@basis,np.array([width,thickness,height])
+    return rotation,np.asarray(dimensions)
+
+
 def pose_geometry(center, rotation, dimensions, k, distortion, **metadata):
     """One fixed-size model supplies outline, center marker and reported pose."""
-    width,height,thickness=dimensions
-    face=center-rotation[:,2]*thickness/2
+    face_kind=metadata.get('face_kind','broad')
+    local_rotation,local_dimensions=face_model(rotation,dimensions,face_kind)
+    width,height,thickness=local_dimensions
+    face=center-local_rotation[:,2]*thickness/2
     signs=np.array([[-1,-1],[1,-1],[1,1],[-1,1]],float)
-    xyz=face+signs[:,:1]*rotation[:,0]*width/2+signs[:,1:]*rotation[:,1]*height/2
+    xyz=face+signs[:,:1]*local_rotation[:,0]*width/2+signs[:,1:]*local_rotation[:,1]*height/2
     if not np.isfinite(xyz).all() or np.any(xyz[:,2]<=.05):return None
     pixels=cv2.projectPoints(np.vstack([xyz,face]),np.zeros(3),np.zeros(3),k,distortion)[0].reshape(-1,2)
     return dict(center=center,rotation=rotation,surface=face,corners_camera=xyz,
@@ -478,7 +518,7 @@ def candidate_plane(depth,detection,k,distortion,tolerance=.04):
     return fit_surface_plane(np.column_stack([xy*z[:,None],z]),tolerance)
 
 
-def fixed_face_fit(bgr,depth,k,distortion,dimensions,detection,measurement=None,previous=None):
+def fit_visible_face(bgr,depth,k,distortion,dimensions,detection,measurement=None,previous=None):
     """Sparse fixed-size local search scored against depth AND visible RGB edges.
 
     Unlike the other branch's all-angle image correlations, project only a
@@ -584,6 +624,47 @@ def fixed_face_fit(bgr,depth,k,distortion,dimensions,detection,measurement=None,
                          score=score,coverage=coverage,edge_error=edge_error,pose_source=source)
 
 
+def fixed_face_fit(bgr,depth,k,distortion,dimensions,detection,measurement=None,previous=None):
+    """Try real cuboid faces; a narrow edge is not a malformed broad face.
+
+    Plain brown faces use their silhouette and depth, without requiring stripes.
+    Each returned rotation still describes the same physical box axes.
+    """
+    result=fit_visible_face(bgr,depth,k,distortion,dimensions,detection,measurement,previous
+                           if previous is not None and previous.get('face_kind','broad')=='broad' else None)
+    if result is not None:
+        result['face_kind']='broad'
+        return result
+    best=None
+    for kind in ('side','end'):
+        basis,local_dimensions=face_model(np.eye(3),dimensions,kind)
+        if getattr(detection,'pose_corners',None) is not None:
+            plane=candidate_plane(depth,detection,k,distortion)
+            if plane is None:continue
+            _,normal,center=plane
+            xy=cv2.undistortPoints(detection[0].reshape(-1,1,2),k,distortion).reshape(-1,2)
+            rays=np.column_stack([xy,np.ones(4)])
+            denominators=rays@normal
+            if np.any(denominators<=1e-6):continue
+            xyz=rays*((center@normal)/denominators)[:,None]
+            lengths=np.linalg.norm(np.roll(xyz,-1,axis=0)-xyz,axis=1)
+            measured=np.sort([(lengths[0]+lengths[2])/2,(lengths[1]+lengths[3])/2])
+            if np.any(np.abs(measured/np.sort(local_dimensions[:2])-1)>.18):continue
+        local=fit_visible_face(bgr,depth,k,distortion,local_dimensions,detection)
+        if local is None:continue
+        # Full silhouettes must agree in area as well as interior depth. This
+        # prevents a small face from fitting somewhere inside a larger object.
+        if getattr(detection,'top_edge',None) is None:
+            observed=cv2.contourArea(detection[0].astype(np.float32))
+            predicted=cv2.contourArea(local['corners'].astype(np.float32))
+            if observed<=0 or not .85< predicted/observed <1.2:continue
+        local['rotation']=local['rotation']@basis.T
+        local['face_kind']=kind
+        local['pose_source']='depth_plane_known_size_'+kind
+        if best is None or local['score']<best['score']:best=local
+    return best
+
+
 class PoseTracker:
     """Time-aware smoothing and motion gates; reject inconsistent jumps."""
     def __init__(self):
@@ -591,7 +672,7 @@ class PoseTracker:
 
     def search_region(self,k,distortion,dimensions,stamp,shape):
         if self.failures>=2 or self.result is None or stamp-self.stamp>1.0 or stamp<=self.stamp:return None
-        result=pose_geometry(self.result['center'],self.result['rotation'],dimensions,k,distortion)
+        result=pose_geometry(self.result['center'],self.result['rotation'],dimensions,k,distortion,face_kind=self.result.get('face_kind','broad'))
         if result is None:return None
         corners=result['corners'];lo=corners.min(axis=0);hi=corners.max(axis=0)
         margin=np.maximum(35.,(hi-lo)*.4)
@@ -606,7 +687,10 @@ class PoseTracker:
         dt=stamp-self.stamp
         old=self.result
         rotation=result['rotation']
-        alternatives=[rotation,rotation@np.diag([-1.,-1.,1.])]
+        kind=result.get('face_kind','broad')
+        basis,_=face_model(np.eye(3),dimensions,kind)
+        symmetry=basis@np.diag([-1.,-1.,1.])@basis.T
+        alternatives=[rotation,rotation@symmetry]
         def angle(r):return math.acos(float(np.clip((np.trace(old['rotation'].T@r)-1)/2,-1,1)))
         rotation=min(alternatives,key=angle)
         if np.linalg.norm(result['center']-old['center'])>.04+dt*.8 or angle(rotation)>math.radians(15+90*dt):
@@ -620,7 +704,7 @@ class PoseTracker:
         mixed=old['rotation']*(1-alpha)+rotation*alpha
         u,_,vt=np.linalg.svd(mixed)
         rotation=u@np.diag([1.,1.,np.linalg.det(u@vt)])@vt
-        metadata={key:result[key] for key in ('score','coverage','edge_error','pose_source') if key in result}
+        metadata={key:result[key] for key in ('score','coverage','edge_error','pose_source','face_kind') if key in result}
         smooth=pose_geometry(center,rotation,dimensions,k,distortion,**metadata)
         self.result=smooth;self.stamp=stamp;self.pending=None
         return smooth
