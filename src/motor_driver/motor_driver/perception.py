@@ -89,12 +89,58 @@ def fit_outer_edges(contour, seed, offset):
 
 
 
-def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None):
+def foreground_depth_mask(brown, depth):
+    """Keep the dominant brown-depth cluster, never the similarly colored far background."""
+    z=cv2.resize(depth,(brown.shape[1],brown.shape[0]),interpolation=cv2.INTER_NEAREST)
+    valid=np.isfinite(z)&(z>0.1)&(z<8.)
+    values=z[(brown>0)&valid]
+    if len(values)<30:
+        return None
+    hist,edges=np.histogram(values,bins=np.arange(0,8.05,.05))
+    peak=int(hist.argmax())
+    near=(edges[peak]+edges[peak+1])/2
+    band=valid&(np.abs(z-near)<max(.18,near*.12))
+    # Only bridge tiny missing-depth gaps, not depth jumps to other objects.
+    return cv2.dilate(band.astype(np.uint8),np.ones((3,3),np.uint8))>0
+
+
+def three_visible_edges(points, seed, offset):
+    """Top and two sides for the bottom-clipped case, fitted from actual gradients."""
+    x,y,w,h=cv2.boundingRect(seed)
+    center=np.array([x+w/2,y+h/2])-offset
+    pts=points.reshape(-1,2).astype(float)
+    coords=pts-center
+    lines=[]
+    for axis,sign in [(0,-1),(1,-1),(0,1)]:
+        other=1-axis
+        band=(np.abs(coords[:,other])<[w,h][other]*.35)&(coords[:,axis]*sign>[w,h][axis]*.42)
+        selected=pts[band];values=coords[band,axis]
+        if len(values)<5:return None
+        bins=np.floor(values).astype(int);origin=bins.min()
+        hist=np.bincount(bins-origin)
+        peak=np.argmax(np.convolve(hist,np.ones(5),mode='same'))+origin
+        selected=selected[np.abs(values-peak)<2]
+        if len(selected)<5:return None
+        if np.ptp(selected[:,other])<[w,h][other]*.3:return None
+        vx,vy,px,py=cv2.fitLine(selected.astype(np.float32),cv2.DIST_HUBER,0,.01,.01).ravel()
+        lines.append((np.array([vx,vy]),np.array([px,py])))
+    corners=[]
+    for a,b in [(0,1),(1,2)]:
+        da,pa=lines[a];db,pb=lines[b];matrix=np.column_stack([da,-db])
+        if abs(np.linalg.det(matrix))<.2:return None
+        corners.append(pa+np.linalg.solve(matrix,pb-pa)[0]*da+offset)
+    return np.array(corners),lines
+
+
+def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None, depth=None):
     """HSV locates brown; recover surrounding dark borders in a small local ROI."""
     scale = min(1.0, 320.0 / bgr.shape[1])
     small = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else bgr
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     brown = cv2.inRange(hsv, np.array(hsv_low, np.uint8), np.array(hsv_high, np.uint8))
+    foreground=foreground_depth_mask(brown,depth) if depth is not None else None
+    if foreground is not None:
+        brown[~foreground]=0
     mask = cv2.morphologyEx(brown, cv2.MORPH_OPEN, np.ones((3,3),np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5),np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -110,6 +156,8 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None):
         roi = hsv[y0:y1,x0:x1]
         # Include nearby dark frame, but not pale floor merely sharing brown hue.
         combined = ((brown[y0:y1,x0:x1] > 0) | (roi[:,:,2] < 105)).astype(np.uint8)*255
+        if foreground is not None:
+            combined[~foreground[y0:y1,x0:x1]]=0
         combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((3,3),np.uint8))
         local, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         seed_center = (x+w/2-x0, y+h/2-y0)
@@ -135,6 +183,8 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None):
             corners = pose_corners
         else:
             edges = cv2.Canny(cv2.cvtColor(small[y0:y1,x0:x1],cv2.COLOR_BGR2GRAY),40,100)
+            if foreground is not None:
+                edges[~foreground[y0:y1,x0:x1]]=0
             edge_points = cv2.findNonZero(edges)
             fitted = fit_outer_edges(edge_points,seed,np.array([x0,y0])) if edge_points is not None else None
             if fitted is not None:
@@ -156,7 +206,20 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None):
         right,bottom = min(bgr.shape[1],rx+rw),min(bgr.shape[0],ry+rh)
         polygon = np.zeros((bottom-ry,right-rx),np.uint8)
         cv2.fillConvexPoly(polygon,integer-[rx,ry],255)
-        return FaceDetection(corners,pixel,(polygon,rx,ry),pose_corners)
+        detection=FaceDetection(corners,pixel,(polygon,rx,ry),pose_corners)
+        detection.top_edge=None
+        # Do not mistake a clipped frame boundary for a physical box edge.
+        if y+h>=small.shape[0]-2 and y>2 and x>2 and x+w<small.shape[1]-2:
+            local_edges=cv2.Canny(cv2.cvtColor(small[y0:y1,x0:x1],cv2.COLOR_BGR2GRAY),40,100)
+            if foreground is not None:
+                local_edges[~foreground[y0:y1,x0:x1]]=0
+            points=cv2.findNonZero(local_edges)
+            partial=three_visible_edges(points,seed,np.array([x0,y0])) if points is not None else None
+            if partial is not None:
+                detection.top_edge=partial[0]/scale
+                detection.side_lines=[(v,pt/scale+np.array([x0,y0])/scale) for v,pt in (partial[1][0],partial[1][2])]
+                detection.pose_corners=None
+        return detection
     return None
 
 
@@ -189,6 +252,56 @@ def fit_surface_plane(samples, tolerance):
     return clean,normal,center
 
 
+def estimate_bottom_clipped(depth,k,distortion,dimensions,detection,tolerance,warn=None):
+    """Infer only the hidden bottom using a depth plane, measured top, and known size."""
+    _,_,(polygon,x0,y0)=detection
+    roi=depth[y0:y0+polygon.shape[0],x0:x0+polygon.shape[1]]
+    grid_x=np.linspace(0,roi.shape[1]-1,min(24,roi.shape[1]),dtype=int)
+    grid_y=np.linspace(0,roi.shape[0]-1,min(24,roi.shape[0]),dtype=int)
+    xx,yy=np.meshgrid(grid_x,grid_y)
+    eroded=cv2.erode(polygon,np.ones((5,5),np.uint8),borderType=cv2.BORDER_CONSTANT,borderValue=0)
+    valid=(eroded[yy,xx]>0)&np.isfinite(roi[yy,xx])&(roi[yy,xx]>.1)&(roi[yy,xx]<8.)
+    xx,yy=xx[valid],yy[valid]
+    if len(xx)<20:return None
+    indices=np.linspace(0,len(xx)-1,min(150,len(xx)),dtype=int);xx,yy=xx[indices],yy[indices]
+    z=roi[yy,xx]
+    xy=cv2.undistortPoints(np.column_stack([xx+x0,yy+y0]).astype(float).reshape(-1,1,2),k,distortion).reshape(-1,2)
+    samples=np.column_stack([xy*z[:,None],z]);plane=fit_surface_plane(samples,tolerance)
+    if plane is None:return None
+    _,normal,plane_center=plane
+    top=detection.top_edge
+    xy=cv2.undistortPoints(top.reshape(-1,1,2),k,distortion).reshape(-1,2)
+    rays=np.column_stack([xy,np.ones(2)]);denom=rays@normal
+    if np.any(denom<=1e-6):return None
+    top_xyz=rays*((plane_center@normal)/denom)[:,None]
+    edge=top_xyz[1]-top_xyz[0];length=np.linalg.norm(edge)
+    width,height,thickness=dimensions
+    errors=np.abs(length/np.array([width,height])-1.)
+    axis=int(errors.argmin())
+    if errors[axis]>.10:return None
+    right=edge/length;down=np.cross(normal,right);down/=np.linalg.norm(down)
+    vertical=height if axis==0 else width
+    xyz=np.array([top_xyz[0],top_xyz[1],top_xyz[1]+down*vertical,top_xyz[0]+down*vertical])
+    if not np.isfinite(xyz).all() or np.any(xyz[:,2]<=0.1):
+        return None
+    corners=cv2.projectPoints(xyz,np.zeros(3),np.zeros(3),k,distortion)[0].reshape(-1,2)
+    if not np.isfinite(corners).all() or np.min(corners[2:,1])<depth.shape[0]-3:
+        return None  # The inferred edge must actually lie outside the visible image.
+    # Both measured side lines must agree with the inferred lower corners.
+    for corner,(direction,point) in zip(corners[[3,2]],detection.side_lines):
+        delta=corner-point
+        if abs(direction[0]*delta[1]-direction[1]*delta[0])>6.:
+            return None
+    surface=xyz.mean(axis=0)
+    axis_x=right if axis==0 else down
+    axis_y=np.cross(normal,axis_x);axis_y/=np.linalg.norm(axis_y)
+    rotation=np.column_stack([axis_x,axis_y,normal])
+    pixel=cv2.projectPoints(surface[None],np.zeros(3),np.zeros(3),k,distortion)[0].ravel()
+    return {'corners_camera':xyz,'pixel':pixel,'surface':surface,
+            'center':surface+normal*thickness/2,'rotation':rotation,'corners':corners,
+            'pose_source':'depth_plane_known_size_bottom_clipped'}
+
+
 def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
                     minimum_area=1200., depth_tolerance=0.04, reprojection_limit=4., detection=None,
                     warn=None):
@@ -198,9 +311,11 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
             warn(f'Pose rejected: {reason}')
         return None
 
-    detection = detection if detection is not None else detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=warn)
+    detection = detection if detection is not None else detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=warn, depth=depth)
     if detection is None:
         return reject('no brown rectangular face detected')
+    if getattr(detection,'top_edge',None) is not None:
+        return estimate_bottom_clipped(depth,k,distortion,dimensions,detection,depth_tolerance,warn)
     if isinstance(detection, FaceDetection) and detection.pose_corners is None:
         return reject('2D brown detection available, but physical outer corners are unresolved')
     corners, pixel, (polygon, x0, y0) = detection
@@ -416,8 +531,14 @@ class Perception(Node):
             return
         try:
             bgr = self.bridge.compressed_imgmsg_to_cv2(rgb, 'bgr8')
+            depth_image=None
+            candidate_depth=self.latest_depth
+            if (candidate_depth is not None and candidate_depth.header.frame_id==rgb.header.frame_id
+                    and abs(self.stamp_seconds(candidate_depth.header)-self.stamp_seconds(rgb.header))<=.1
+                    and (candidate_depth.width,candidate_depth.height)==(bgr.shape[1],bgr.shape[0])):
+                depth_image=depth_in_meters(self.bridge.imgmsg_to_cv2(candidate_depth,'passthrough'),candidate_depth.encoding)
             detection = detect_face(bgr, self.values['brown_hsv_low'], self.values['brown_hsv_high'],
-                                    self.values['min_contour_area'], warn=self.warn)
+                                    self.values['min_contour_area'], warn=self.warn, depth=depth_image)
             info = self.camera_info
             if self.get_parameter('capture_next_frame').value:
                 self.capture_frame(rgb, bgr, info, detection)
@@ -450,7 +571,7 @@ class Perception(Node):
             if depth is None or abs(self.stamp_seconds(depth.header)-self.stamp_seconds(rgb.header)) > 0.1:
                 self.warn('2D detection active; aligned depth is missing or older than 0.1 s')
                 return
-            self.process(rgb, depth, info, bgr=bgr, detection=detection)
+            self.process(rgb, depth, info, bgr=bgr, detection=detection, depth_m=depth_image)
         except (ValueError, CvBridgeError, cv2.error) as error:
             self.warn(str(error))
 
@@ -497,7 +618,7 @@ class Perception(Node):
             self.get_logger().warning(message)
             self.last_warning = now
 
-    def process(self, rgb, depth_msg, info, bgr=None, detection=None):
+    def process(self, rgb, depth_msg, info, bgr=None, detection=None, depth_m=None):
         try:
             if bgr is None:
                 bgr = self.bridge.imgmsg_to_cv2(rgb, 'bgr8')
@@ -511,7 +632,7 @@ class Perception(Node):
             distortion = np.asarray(info.d, np.float64)
             if not np.isfinite(k).all() or k[0, 0] <= 0 or k[1, 1] <= 0 or not np.isfinite(distortion).all():
                 raise ValueError('Invalid camera intrinsics')
-            depth = depth_in_meters(self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough'), depth_msg.encoding)
+            depth = depth_m if depth_m is not None else depth_in_meters(self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough'), depth_msg.encoding)
             if detection is None:
                 detection = detect_face(bgr, self.values['brown_hsv_low'], self.values['brown_hsv_high'],
                                         self.values['min_contour_area'], warn=self.warn)

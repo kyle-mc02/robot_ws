@@ -105,6 +105,7 @@ class BasestationNode(Node):
         pose, point, info = self.detected_pose, self.detected_center, self.camera_info
         fresh_pose = (pose is not None and time.monotonic()-self.last_detection_time < 0.6
                       and abs(self.stamp_seconds(pose.header)-self.stamp_seconds(image_header)) < 0.5)
+        pose_drawn = False
         lines = ['Object: unavailable / stale']
         if fresh_pose:
             position, q = pose.pose.position, pose.pose.orientation
@@ -148,8 +149,9 @@ class BasestationNode(Node):
                                         outline = np.clip(outline.reshape(-1, 2), -10000, 10000).astype(np.int32)
                                         cv2.polylines(frame, [outline], True, (0, 255, 0), 2)
                             cv2.circle(frame, (u, v), 4, (0, 255, 255), -1)
+                            pose_drawn = True
         rays = self.detection_rays
-        if (rays is not None and info is not None and len(rays.points) == 10
+        if (not pose_drawn and rays is not None and info is not None and len(rays.points) == 10
                 and time.monotonic()-self.last_rays_time < 0.6
                 and rays.header.frame_id == image_header.frame_id == info.header.frame_id
                 and abs(self.stamp_seconds(rays.header)-self.stamp_seconds(image_header)) < 0.5
