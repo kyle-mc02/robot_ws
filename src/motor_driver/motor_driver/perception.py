@@ -132,12 +132,17 @@ def three_visible_edges(points, seed, offset):
     return np.array(corners),lines
 
 
-def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None, depth=None):
+def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None, depth=None, search_region=None):
     """HSV locates brown; recover surrounding dark borders in a small local ROI."""
     scale = min(1.0, 320.0 / bgr.shape[1])
     small = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else bgr
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     brown = cv2.inRange(hsv, np.array(hsv_low, np.uint8), np.array(hsv_high, np.uint8))
+    if search_region is not None:
+        left,top,right,bottom=np.rint(np.asarray(search_region)*scale).astype(int)
+        restricted=np.zeros_like(brown)
+        restricted[top:bottom,left:right]=brown[top:bottom,left:right]
+        brown=restricted
     foreground=foreground_depth_mask(brown,depth) if depth is not None else None
     if foreground is not None:
         brown[~foreground]=0
@@ -445,6 +450,182 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     return {'corners_camera': corners_camera, 'pixel': pixel, 'surface': surface, 'center': best[1], 'rotation': best[2], 'corners': corners}
 
 
+def pose_geometry(center, rotation, dimensions, k, distortion, **metadata):
+    """One fixed-size model supplies outline, center marker and reported pose."""
+    width,height,thickness=dimensions
+    face=center-rotation[:,2]*thickness/2
+    signs=np.array([[-1,-1],[1,-1],[1,1],[-1,1]],float)
+    xyz=face+signs[:,:1]*rotation[:,0]*width/2+signs[:,1:]*rotation[:,1]*height/2
+    if not np.isfinite(xyz).all() or np.any(xyz[:,2]<=.05):return None
+    pixels=cv2.projectPoints(np.vstack([xyz,face]),np.zeros(3),np.zeros(3),k,distortion)[0].reshape(-1,2)
+    return dict(center=center,rotation=rotation,surface=face,corners_camera=xyz,
+                corners=pixels[:4],pixel=pixels[4],**metadata)
+
+
+def candidate_plane(depth,detection,k,distortion,tolerance=.04):
+    cached=getattr(detection,'plane',None)
+    if cached is not None:return cached
+    polygon,x0,y0=detection[2]
+    roi=depth[y0:y0+polygon.shape[0],x0:x0+polygon.shape[1]]
+    xx,yy=np.meshgrid(np.linspace(0,roi.shape[1]-1,min(24,roi.shape[1]),dtype=int),
+                      np.linspace(0,roi.shape[0]-1,min(24,roi.shape[0]),dtype=int))
+    valid=(polygon[yy,xx]>0)&np.isfinite(roi[yy,xx])&(roi[yy,xx]>.1)&(roi[yy,xx]<8)
+    xx,yy=xx[valid],yy[valid]
+    if len(xx)<20:return None
+    ids=np.linspace(0,len(xx)-1,min(150,len(xx)),dtype=int);xx,yy=xx[ids],yy[ids]
+    z=roi[yy,xx]
+    xy=cv2.undistortPoints(np.column_stack([xx+x0,yy+y0]).astype(float).reshape(-1,1,2),k,distortion).reshape(-1,2)
+    return fit_surface_plane(np.column_stack([xy*z[:,None],z]),tolerance)
+
+
+def fixed_face_fit(bgr,depth,k,distortion,dimensions,detection,measurement=None,previous=None):
+    """Sparse fixed-size local search scored against depth AND visible RGB edges.
+
+    Unlike the other branch's all-angle image correlations, project only a
+    bounded set of model samples. Off-image samples are unobserved, not empty.
+    """
+    plane=candidate_plane(depth,detection,k,distortion)
+    if plane is None:return None
+    _,normal,plane_center=plane
+    width,height,thickness=dimensions
+    corners=detection[0]
+    rays=cv2.undistortPoints(corners.reshape(-1,1,2),k,distortion).reshape(-1,2)
+    rays=np.column_stack([rays,np.ones(4)]);denom=rays@normal
+    if np.any(denom<=1e-6):return None
+    observed_xyz=rays*((plane_center@normal)/denom)[:,None]
+    edge=(observed_xyz[1]-observed_xyz[0]+observed_xyz[2]-observed_xyz[3])/2
+    edge-=normal*(edge@normal)
+    if np.linalg.norm(edge)<1e-6:return None
+    ex=edge/np.linalg.norm(edge);ey=np.cross(normal,ex)
+    seeds=[]
+    if measurement is not None:
+        seeds.append((measurement['surface'],measurement['rotation'][:,0],True))
+    else:
+        for axis in (ex,ey):
+            down=np.cross(normal,ex)
+            center=observed_xyz.mean(axis=0)
+            # Use the measured top to initialize a bottom-clipped face.
+            if getattr(detection,'top_edge',None) is not None:
+                xy=cv2.undistortPoints(detection.top_edge.reshape(-1,1,2),k,distortion).reshape(-1,2)
+                top_rays=np.column_stack([xy,np.ones(2)])
+                top_xyz=top_rays*((plane_center@normal)/(top_rays@normal))[:,None]
+                vertical=height if abs(axis@ex)>.9 else width
+                center=top_xyz.mean(axis=0)+down*vertical/2
+            seeds.append((center,axis,False))
+    if previous is not None:
+        seeds.append((previous['surface'],previous['rotation'][:,0],True))
+    h,w=depth.shape
+    allow_partial=bool(getattr(detection,'top_edge',None) is not None or
+                       np.any(corners[:,0]<3) or np.any(corners[:,0]>w-4) or
+                       np.any(corners[:,1]<3) or np.any(corners[:,1]>h-4))
+    # Restrict edge computation to the candidate neighborhood.
+    x0=max(0,int(corners[:,0].min())-30);x1=min(w,int(corners[:,0].max())+31)
+    y0=max(0,int(corners[:,1].min())-30);y1=min(h,int(corners[:,1].max())+31)
+    if x1<=x0 or y1<=y0:return None
+    gray=cv2.cvtColor(bgr[y0:y1,x0:x1],cv2.COLOR_BGR2GRAY)
+    scale=min(1.,320./gray.shape[1])
+    if scale<1:gray=cv2.resize(gray,None,fx=scale,fy=scale,interpolation=cv2.INTER_AREA)
+    edges=cv2.Canny(gray,40,100)
+    distances=cv2.distanceTransform(255-edges,cv2.DIST_L2,3)
+    # 35 face-interior samples and 64 edge samples, independent of image area.
+    gx,gy=np.meshgrid(np.linspace(-.42,.42,7)*width,np.linspace(-.42,.42,5)*height)
+    interior=np.column_stack([gx.ravel(),gy.ravel()])
+    unit=np.linspace(-.5,.5,16)
+    border=np.vstack([np.column_stack([unit*width,np.full(16,-height/2)]),
+                      np.column_stack([np.full(16,width/2),unit*height]),
+                      np.column_stack([unit*width,np.full(16,height/2)]),
+                      np.column_stack([np.full(16,-width/2),unit*height])])
+    local=np.vstack([interior,border])
+    centers=[];rotations=[];priors=[]
+    for center,axis,anchored in seeds:
+        axis=axis-normal*(axis@normal);axis/=np.linalg.norm(axis)
+        other=np.cross(normal,axis)
+        center=center-normal*((center-plane_center)@normal)
+        angles=(-3.,0.,3.) if anchored else (-12.,-6.,0.,6.,12.)
+        radius=.015 if anchored else .03
+        for degrees in angles:
+            angle=math.radians(degrees)
+            rx=math.cos(angle)*axis+math.sin(angle)*other;ry=np.cross(normal,rx)
+            for dx in (-radius,0.,radius):
+                for dy in (-radius,0.,radius):
+                    centers.append(center+rx*dx+ry*dy)
+                    rotations.append(np.column_stack([rx,ry,normal]))
+                    priors.append((dx/radius)**2+(dy/radius)**2+(degrees/12.)**2)
+    centers=np.asarray(centers);rotations=np.asarray(rotations)
+    xyz=centers[:,None,:]+local[None,:,0,None]*rotations[:,None,:,0]+local[None,:,1,None]*rotations[:,None,:,1]
+    pixels=cv2.projectPoints(xyz.reshape(-1,3),np.zeros(3),np.zeros(3),k,distortion)[0].reshape(len(centers),-1,2)
+    best=None
+    for i,(points,uv) in enumerate(zip(xyz,pixels)):
+        if np.any(points[:,2]<=.1) or not np.isfinite(uv).all():continue
+        visible=(uv[:,0]>=0)&(uv[:,0]<w-1)&(uv[:,1]>=0)&(uv[:,1]<h-1)
+        inside=visible[:len(interior)]
+        if inside.sum()<12 or (not allow_partial and inside.mean()<.98):continue
+        loc=np.rint(uv[:len(interior)][inside]).astype(int)
+        z=depth[loc[:,1],loc[:,0]]
+        residual=np.abs(z-points[:len(interior)][inside,2])
+        good=np.isfinite(z)&(z>.1)&(residual<.025)
+        coverage=good.mean()
+        if coverage<.75:continue
+        projected=(uv[len(interior):]-[x0,y0])*scale
+        edge_visible=visible[len(interior):]&(projected[:,0]>=0)&(projected[:,0]<distances.shape[1]-1)&(projected[:,1]>=0)&(projected[:,1]<distances.shape[0]-1)
+        if edge_visible.sum()<20:continue
+        loc=np.rint(projected[edge_visible]).astype(int)
+        edge_error=np.minimum(distances[loc[:,1],loc[:,0]]/scale,15).mean()
+        if edge_error>7.:continue
+        score=float(edge_error+8*(1-coverage)+.25*priors[i])
+        # Strong measured borders should anchor position, not merely plane occupancy.
+        if measurement is not None:
+            score+=float(np.linalg.norm(centers[i]-measurement['surface']))*60
+        if best is None or score<best[0]:best=(score,i,coverage,float(edge_error))
+    if best is None:return None
+    score,i,coverage,edge_error=best
+    source=measurement.get('pose_source','measured_edges') if measurement else 'fixed_face_local_fit'
+    return pose_geometry(centers[i]+normal*thickness/2,rotations[i],dimensions,k,distortion,
+                         score=score,coverage=coverage,edge_error=edge_error,pose_source=source)
+
+
+class PoseTracker:
+    """Time-aware smoothing and motion gates; reject inconsistent jumps."""
+    def __init__(self):
+        self.result=None;self.stamp=None;self.pending=None;self.failures=0
+
+    def search_region(self,k,distortion,dimensions,stamp,shape):
+        if self.failures>=2 or self.result is None or stamp-self.stamp>1.0 or stamp<=self.stamp:return None
+        result=pose_geometry(self.result['center'],self.result['rotation'],dimensions,k,distortion)
+        if result is None:return None
+        corners=result['corners'];lo=corners.min(axis=0);hi=corners.max(axis=0)
+        margin=np.maximum(35.,(hi-lo)*.4)
+        return (max(0,int(lo[0]-margin[0])),max(0,int(lo[1]-margin[1])),
+                min(shape[1],int(hi[0]+margin[0])+1),min(shape[0],int(hi[1]+margin[1])+1))
+
+    def update(self,result,stamp,dimensions,k,distortion):
+        self.failures=0
+        if self.stamp is not None and stamp<=self.stamp:return None
+        if self.result is None or stamp-self.stamp>1.0:
+            self.result=result;self.stamp=stamp;self.pending=None;return result
+        dt=stamp-self.stamp
+        old=self.result
+        rotation=result['rotation']
+        alternatives=[rotation,rotation@np.diag([-1.,-1.,1.])]
+        def angle(r):return math.acos(float(np.clip((np.trace(old['rotation'].T@r)-1)/2,-1,1)))
+        rotation=min(alternatives,key=angle)
+        if np.linalg.norm(result['center']-old['center'])>.04+dt*.8 or angle(rotation)>math.radians(15+90*dt):
+            if (self.pending is None or np.linalg.norm(result['center']-self.pending['center'])>.04+dt*.8
+                    or math.acos(float(np.clip((np.trace(self.pending['rotation'].T@rotation)-1)/2,-1,1)))>math.radians(20)):
+                self.pending=result;return None
+            self.result=result;self.stamp=stamp;self.pending=None;return result
+        tau=.1 if result.get('edge_error',99)<3 else .2
+        alpha=1-math.exp(-dt/tau)
+        center=old['center']*(1-alpha)+result['center']*alpha
+        mixed=old['rotation']*(1-alpha)+rotation*alpha
+        u,_,vt=np.linalg.svd(mixed)
+        rotation=u@np.diag([1.,1.,np.linalg.det(u@vt)])@vt
+        metadata={key:result[key] for key in ('score','coverage','edge_error','pose_source') if key in result}
+        smooth=pose_geometry(center,rotation,dimensions,k,distortion,**metadata)
+        self.result=smooth;self.stamp=stamp;self.pending=None
+        return smooth
+
+
 class Perception(Node):
     def __init__(self):
         super().__init__('perception')
@@ -458,7 +639,7 @@ class Perception(Node):
             'box_dimensions': [0.42, 0.32, 0.055],
             'brown_hsv_low': [0, 50, 20], 'brown_hsv_high': [40, 255, 255],
             'min_contour_area': 1200.0,
-            'processing_rate_hz': 3.0,
+            'processing_rate_hz': 6.0,
             'capture_next_frame': False, 'capture_directory': '~/robot_ws/perception_captures',
             'depth_tolerance': 0.04, 'max_reprojection_error': 4.0}
         self.values = {}
@@ -487,6 +668,7 @@ class Perception(Node):
             raise ValueError('processing_rate_hz must be positive and <= 15')
         cv2.setNumThreads(1)  # Avoid competing with camera encoding across CPU cores.
         self.bridge = CvBridge()
+        self.tracker = PoseTracker()
         self.buffer = Buffer()
         self.listener = TransformListener(self.buffer, self)
         if p['publish_mount_tf']:
@@ -537,12 +719,25 @@ class Perception(Node):
                     and abs(self.stamp_seconds(candidate_depth.header)-self.stamp_seconds(rgb.header))<=.1
                     and (candidate_depth.width,candidate_depth.height)==(bgr.shape[1],bgr.shape[0])):
                 depth_image=depth_in_meters(self.bridge.imgmsg_to_cv2(candidate_depth,'passthrough'),candidate_depth.encoding)
-            detection = detect_face(bgr, self.values['brown_hsv_low'], self.values['brown_hsv_high'],
-                                    self.values['min_contour_area'], warn=self.warn, depth=depth_image)
             info = self.camera_info
+            region=None
+            if not hasattr(self,'tracker'):
+                self.tracker=PoseTracker()
+            if self.tracker.result is not None and info is not None and info.header.frame_id==rgb.header.frame_id:
+                k=np.asarray(info.k,np.float64).reshape(3,3)
+                if np.isfinite(k).all() and k[0,0]>0 and k[1,1]>0:
+                    region=self.tracker.search_region(k,np.asarray(info.d,np.float64),self.dimensions,
+                                                     self.stamp_seconds(rgb.header),bgr.shape)
+            detection = detect_face(bgr, self.values['brown_hsv_low'], self.values['brown_hsv_high'],
+                                    self.values['min_contour_area'], warn=self.warn, depth=depth_image,
+                                    search_region=region)
+            if detection is None and region is not None:
+                detection=detect_face(bgr,self.values['brown_hsv_low'],self.values['brown_hsv_high'],
+                                      self.values['min_contour_area'],warn=self.warn,depth=depth_image)
             if self.get_parameter('capture_next_frame').value:
                 self.capture_frame(rgb, bgr, info, detection)
             if detection is None:
+                self.tracker.failures+=1
                 self.marker_pub.publish(MarkerArray(markers=[Marker(
                     ns='detection_rays', id=4, action=Marker.DELETE)]))
                 return
@@ -639,20 +834,35 @@ class Perception(Node):
             if detection is None:
                 self.warn('No brown rectangular target found; check lighting and brown_hsv_low/high')
                 return
-            result = estimate_target(bgr, depth, k, distortion, self.dimensions,
+            # Keep measured perspective edges as the anchor; the fixed-size depth
+            # fit can also recover a pose when four physical corners are unavailable.
+            measurement = estimate_target(bgr, depth, k, distortion, self.dimensions,
                                      self.values['brown_hsv_low'], self.values['brown_hsv_high'],
                                      self.values['min_contour_area'], self.values['depth_tolerance'],
-                                     self.values['max_reprojection_error'], detection=detection,
-                                     warn=self.warn)
+                                     self.values['max_reprojection_error'], detection=detection)
+            if not hasattr(self,'tracker'):
+                self.tracker=PoseTracker()
+            stamp=Perception.stamp_seconds(rgb.header)
+            previous=self.tracker.result if self.tracker.stamp is not None and 0<stamp-self.tracker.stamp<1 else None
+            result=fixed_face_fit(bgr,depth,k,distortion,self.dimensions,detection,
+                                  measurement=measurement,previous=previous)
+            if result is None and measurement is not None:
+                result=pose_geometry(measurement['center'],measurement['rotation'],self.dimensions,k,distortion,
+                                     pose_source=measurement.get('pose_source','measured_edges'))
             if result is None:
-                return  # RViz markers expire after 0.5 s; no stale pose is republished.
+                self.tracker.failures+=1
+                self.warn('Pose rejected: insufficient consistent face depth and visible boundary support')
+                return
+            result=self.tracker.update(result,stamp,self.dimensions,k,distortion)
+            if result is None:
+                return  # No stale pose is republished while a jump is being checked.
             point = PointStamped(header=rgb.header)
             point.point.x, point.point.y, point.point.z = map(float, result['surface'])
             self.point_camera_pub.publish(point)
             if self.debug_pub.get_subscription_count():
                 cv2.polylines(bgr, [result['corners'].astype(np.int32)], True, (0, 255, 0), 2)
                 u, v = np.rint(result['pixel']).astype(int)
-                cv2.circle(bgr, (u, v), 4, (0, 0, 255), -1)
+                cv2.circle(bgr, (u, v), 4, (0, 255, 255), -1)
                 cv2.putText(bgr, f'center ({u}, {v}) px; depth {result["surface"][2]:.2f}m',
                             (8, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 debug = self.bridge.cv2_to_compressed_imgmsg(bgr)
