@@ -6,6 +6,10 @@ has a 180-degree ambiguity; this is not a uniquely identified object frame.
 """
 import math
 import heapq
+import json
+from pathlib import Path
+from datetime import datetime, timezone
+from rclpy.parameter import Parameter
 
 import cv2
 import numpy as np
@@ -43,61 +47,102 @@ def deproject(pixel, z, k, distortion):
     return np.array([ray[0] * z, ray[1] * z, z])
 
 
-def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None):
-    """Return image corners, centroid, and (local mask, x offset, y offset).
+class FaceDetection(tuple):
+    """Image box is always usable; pose corners require a recovered boundary."""
+    def __new__(cls, corners, pixel, region, pose_corners):
+        result = super().__new__(cls, (corners, pixel, region))
+        result.pose_corners = pose_corners
+        return result
 
-    Brown-first segmentation; dark stripes are allowed, never required.
-    """
-    # Work at <=320 px width rather than running Canny across every full RGB frame.
+
+def ordered_corners(corners):
+    corners = np.asarray(corners, np.float64).reshape(4, 2)
+    center = corners.mean(axis=0)
+    corners = corners[np.argsort(np.arctan2(corners[:, 1]-center[1], corners[:, 0]-center[0]))]
+    return np.roll(corners, -np.argmin(corners.sum(axis=1)), axis=0)
+
+
+def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None):
+    """HSV locates brown; recover surrounding dark borders in a small local ROI."""
     scale = min(1.0, 320.0 / bgr.shape[1])
     small = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else bgr
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     brown = cv2.inRange(hsv, np.array(hsv_low, np.uint8), np.array(hsv_high, np.uint8))
-    # Reconnect brown regions split by black lines; fill internal stripe gaps.
-    mask = cv2.morphologyEx(brown, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    mask = cv2.morphologyEx(brown, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    ranked = ((cv2.contourArea(contour), index) for index, contour in enumerate(contours))
-    rejected_corners = False
+    ranked = ((cv2.contourArea(c), i) for i, c in enumerate(contours))
     for area, index in heapq.nlargest(10, ranked, key=lambda item: item[0]):
-        contour = contours[index]
-        if area < minimum_area * scale**2 or area > small.shape[0] * small.shape[1] * 0.9:
+        if area < minimum_area * scale**2 or area > small.shape[0]*small.shape[1]*0.85:
             continue
-        hull = cv2.convexHull(contour)
-        quad = cv2.approxPolyDP(hull, 0.025 * cv2.arcLength(hull, True), True)
-        if len(quad) != 4 or not cv2.isContourConvex(quad):
-            rejected_corners = True
-            continue
-        x, y, w, h = cv2.boundingRect(quad)
-        x0, y0 = max(0, x), max(0, y)
-        x1, y1 = min(mask.shape[1], x+w), min(mask.shape[0], y+h)
-        if x1 <= x0 or y1 <= y0:
-            continue
-        region = np.zeros((y1-y0, x1-x0), np.uint8)
-        cv2.fillConvexPoly(region, quad - np.array([x0, y0], np.int32), 255)
-        if np.count_nonzero((brown[y0:y1, x0:x1] > 0) & (region > 0)) < 0.25 * np.count_nonzero(region):
-            continue
-        corners = quad.reshape(4, 2).astype(np.float64) / scale
-        moments = cv2.moments(corners.astype(np.float32))
-        if abs(moments['m00']) < 1e-8:
-            continue
-        pixel = np.array([moments['m10'] / moments['m00'], moments['m01'] / moments['m00']])
-        angles = np.arctan2(corners[:, 1]-pixel[1], corners[:, 0]-pixel[0])
-        corners = corners[np.argsort(angles)]
-        corners = np.roll(corners, -np.argmin(corners.sum(axis=1)), axis=0)
-        integer_corners = np.rint(corners).astype(np.int32)
-        x, y, w, h = cv2.boundingRect(integer_corners)
-        x0, y0 = max(0, x), max(0, y)
-        x1, y1 = min(bgr.shape[1], x+w), min(bgr.shape[0], y+h)
-        if x1 <= x0 or y1 <= y0:
-            continue
-        polygon = np.zeros((y1-y0, x1-x0), np.uint8)
-        cv2.fillConvexPoly(polygon, integer_corners - np.array([x0, y0], np.int32), 255)
-        # Keep image-space corners/center, but allocate only a target-local mask.
-        return corners, pixel, (polygon, x0, y0)
-    if rejected_corners and warn is not None:
-        warn('Pose unavailable: could not identify four perspective face corners '
-             '(minimum-area rectangle fallback disabled)')
+        seed = contours[index]
+        x, y, w, h = cv2.boundingRect(seed)
+        pad = max(5, int(min(w,h)*0.3))
+        x0, y0 = max(0,x-pad), max(0,y-pad)
+        x1, y1 = min(small.shape[1],x+w+pad), min(small.shape[0],y+h+pad)
+        roi = hsv[y0:y1,x0:x1]
+        # Include nearby dark frame, but not pale floor merely sharing brown hue.
+        combined = ((brown[y0:y1,x0:x1] > 0) | (roi[:,:,2] < 105)).astype(np.uint8)*255
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((3,3),np.uint8))
+        local, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        seed_center = (x+w/2-x0, y+h/2-y0)
+        candidates = []
+        for contour in local:
+            if cv2.pointPolygonTest(contour,seed_center,False) < 0:
+                continue
+            hull = cv2.convexHull(contour)
+            if not 0.85*area <= cv2.contourArea(hull) <= 2.8*area:
+                continue
+            for epsilon in (0.015,0.025,0.04):
+                quad = cv2.approxPolyDP(hull,epsilon*cv2.arcLength(hull,True),True)
+                if len(quad)==4 and cv2.isContourConvex(quad):
+                    candidates.append((cv2.contourArea(quad),quad.reshape(4,2)+[x0,y0]))
+                    break
+        pose_corners = None
+        if candidates:
+            pose_corners = ordered_corners(max(candidates,key=lambda q:q[0])[1]/scale)
+            corners = pose_corners
+        else:
+            # Detection survives irregular contours; never feed synthetic rectangle
+            # corners to PnP as if they were physical perspective corners.
+            corners = ordered_corners(cv2.boxPoints(cv2.minAreaRect(seed))/scale)
+        pixel = corners.mean(axis=0)
+        integer = np.rint(corners).astype(np.int32)
+        rx,ry,rw,rh = cv2.boundingRect(integer)
+        rx,ry = max(0,rx),max(0,ry)
+        right,bottom = min(bgr.shape[1],rx+rw),min(bgr.shape[0],ry+rh)
+        polygon = np.zeros((bottom-ry,right-rx),np.uint8)
+        cv2.fillConvexPoly(polygon,integer-[rx,ry],255)
+        return FaceDetection(corners,pixel,(polygon,rx,ry),pose_corners)
     return None
+
+
+def fit_surface_plane(samples, tolerance):
+    """Bounded deterministic RANSAC, then SVD; reject mixed tray/floor surfaces."""
+    samples = np.asarray(samples,np.float64)
+    if len(samples)<20:
+        return None
+    rng = np.random.default_rng(5)
+    best = np.zeros(len(samples),bool)
+    threshold = min(0.015,tolerance/2)
+    for _ in range(32):
+        a,b,c = samples[rng.choice(len(samples),3,replace=False)]
+        normal = np.cross(b-a,c-a)
+        length = np.linalg.norm(normal)
+        if length<1e-8:
+            continue
+        normal /= length
+        inliers = np.abs((samples-a)@normal)<threshold
+        if inliers.sum()>best.sum():
+            best=inliers
+    if best.sum()<max(20,int(np.ceil(0.75*len(samples)))):
+        return None
+    clean=samples[best]
+    center=clean.mean(axis=0)
+    _,_,vectors=np.linalg.svd(clean-center,full_matrices=False)
+    normal=vectors[-1]
+    if normal@center<0:
+        normal=-normal
+    return clean,normal,center
 
 
 def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
@@ -112,6 +157,8 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     detection = detection if detection is not None else detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=warn)
     if detection is None:
         return reject('no brown rectangular face detected')
+    if isinstance(detection, FaceDetection) and detection.pose_corners is None:
+        return reject('2D brown detection available, but physical outer corners are unresolved')
     corners, pixel, (polygon, x0, y0) = detection
     depth_roi = depth[y0:y0+polygon.shape[0], x0:x0+polygon.shape[1]]
     u, v = np.rint(pixel).astype(int)
@@ -146,6 +193,10 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     rays = cv2.undistortPoints(samples_uv.reshape(-1, 1, 2), k, distortion).reshape(-1, 2)
     sample_z = depth_roi[yy[indices], xx[indices]]
     samples = np.column_stack([rays * sample_z[:, None], sample_z])
+    plane = fit_surface_plane(samples, depth_tolerance)
+    if plane is None:
+        return reject('depth does not support one dominant flat face; use the closed patterned side')
+    samples, measured_normal, measured_center = plane
     best = None
     rejections = []
     for shift in range(2):  # 180-degree alternatives are symmetry-equivalent.
@@ -166,6 +217,9 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
             projected, _ = cv2.projectPoints(object_points, rvec, tvec, k, distortion)
             error = float(np.sqrt(np.mean(np.sum((projected.reshape(-1, 2)-image_points)**2, axis=1))))
             plane_error = float(np.median(np.abs((samples-translation) @ normal)))
+            if np.dot(normal, measured_normal) < math.cos(math.radians(20)):
+                rejections.append(f'{label}: pose normal disagrees with measured depth plane')
+                continue
             if error > reprojection_limit or plane_error > depth_tolerance:
                 rejections.append(f'{label}: reprojection={error:.2f} px '
                                   f'(limit {reprojection_limit:.2f}), plane depth error={plane_error:.4f} m '
@@ -213,9 +267,10 @@ class Perception(Node):
             'publish_mount_tf': True, 'mount_xyz': [0.24, -0.01, 0.55],
             'mount_rpy': [0.0, 0.0, 0.0],
             'box_dimensions': [0.42, 0.32, 0.055],
-            'brown_hsv_low': [0, 25, 20], 'brown_hsv_high': [40, 255, 255],
+            'brown_hsv_low': [0, 50, 20], 'brown_hsv_high': [40, 255, 255],
             'min_contour_area': 1200.0,
             'processing_rate_hz': 3.0,
+            'capture_next_frame': False, 'capture_directory': '~/robot_ws/perception_captures',
             'depth_tolerance': 0.04, 'max_reprojection_error': 4.0}
         self.values = {}
         for name, value in defaults.items():
@@ -290,6 +345,8 @@ class Perception(Node):
             detection = detect_face(bgr, self.values['brown_hsv_low'], self.values['brown_hsv_high'],
                                     self.values['min_contour_area'], warn=self.warn)
             info = self.camera_info
+            if self.get_parameter('capture_next_frame').value:
+                self.capture_frame(rgb, bgr, info, detection)
             if detection is None:
                 self.marker_pub.publish(MarkerArray(markers=[Marker(
                     ns='detection_rays', id=4, action=Marker.DELETE)]))
@@ -322,6 +379,39 @@ class Perception(Node):
             self.process(rgb, depth, info, bgr=bgr, detection=detection)
         except (ValueError, CvBridgeError, cv2.error) as error:
             self.warn(str(error))
+
+    def capture_frame(self, rgb, bgr, info, detection):
+        """Save one camera sample locally, with no extra publisher or image stream."""
+        self.set_parameters([Parameter('capture_next_frame', value=False)])
+        directory = Path(self.get_parameter('capture_directory').value).expanduser()
+        folder = directory / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%f')+'Z')
+        try:
+            folder.mkdir(parents=True,exist_ok=False)
+            suffix = '.png' if 'png' in rgb.format.lower() else '.jpg'
+            (folder/('rgb_original'+suffix)).write_bytes(bytes(rgb.data))
+            cv2.imwrite(str(folder/'rgb.png'),bgr)
+            hsv=cv2.cvtColor(bgr,cv2.COLOR_BGR2HSV)
+            mask=cv2.inRange(hsv,np.array(self.values['brown_hsv_low'],np.uint8),np.array(self.values['brown_hsv_high'],np.uint8))
+            cv2.imwrite(str(folder/'hsv_mask.png'),mask)
+            annotated=bgr.copy()
+            if detection is not None:
+                cv2.polylines(annotated,[detection[0].astype(np.int32)],True,(0,255,0),2)
+            cv2.imwrite(str(folder/'detection.png'),annotated)
+            data={'rgb_frame':rgb.header.frame_id,'rgb_stamp':self.stamp_seconds(rgb.header),
+                  'hsv_low':list(self.values['brown_hsv_low']),'hsv_high':list(self.values['brown_hsv_high'])}
+            if info is not None:
+                data.update({'K':list(info.k),'D':list(info.d),'distortion_model':info.distortion_model,
+                             'width':info.width,'height':info.height,'info_frame':info.header.frame_id})
+            depth=self.latest_depth
+            if depth is not None:
+                np.save(folder/'depth_m.npy',depth_in_meters(self.bridge.imgmsg_to_cv2(depth,'passthrough'),depth.encoding))
+                age=abs(self.stamp_seconds(depth.header)-self.stamp_seconds(rgb.header))
+                data.update({'depth_frame':depth.header.frame_id,'depth_stamp':self.stamp_seconds(depth.header),
+                             'depth_rgb_delta_s':age,'depth_time_matched':age<=0.1})
+            (folder/'camera_info.json').write_text(json.dumps(data,indent=2))
+            self.get_logger().info(f'Saved D435i capture: {folder}')
+        except (OSError,ValueError,CvBridgeError,cv2.error) as error:
+            self.warn(f'Capture failed: {error}')
 
     @staticmethod
     def stamp_seconds(header):
