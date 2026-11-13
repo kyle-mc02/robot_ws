@@ -9,6 +9,7 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Opaq
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def launch_setup(context):
@@ -87,11 +88,16 @@ def launch_setup(context):
                     'topic_queue_size': 5, 'sync_queue_size': 5,
                     'qos_camera_info': 2, 'Vis/MaxDepth': '4'}
         executable = 'rgbd_odometry'
+    # RTAB-Map core parameters are strings, even when they look numeric.
+    def typed(parameters):
+        return {key: ParameterValue(val, value_type=str) if '/' in key else val
+                for key, val in parameters.items()}
+
     actions.extend([
         Node(package='rtabmap_odom', executable=executable, name=executable,
-             namespace='slam', output='screen', parameters=[common, odometry], remappings=remaps),
+             namespace='slam', output='screen', parameters=[typed(common), typed(odometry)], remappings=remaps),
         Node(package='rtabmap_slam', executable='rtabmap', name='rtabmap',
-             namespace='slam', output='screen', parameters=[common, mapping], remappings=remaps)])
+             namespace='slam', output='screen', parameters=[typed(common), typed(mapping)], remappings=remaps)])
     if value('rviz') == 'true':
         actions.append(viewer)
     return actions
