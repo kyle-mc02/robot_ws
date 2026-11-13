@@ -61,7 +61,7 @@ def launch_setup(context):
                'RGBD/LinearUpdate': '.10', 'RGBD/AngularUpdate': '.10',
                'Grid/Sensor': '1' if sensor == 'rgbd' else '0',
                'Grid/3D': 'true', 'Grid/CellSize': '.05', 'Grid/RayTracing': 'true',
-               'Grid/NormalsSegmentation': 'false', 'Grid/MinGroundHeight': '-.15',
+               'Grid/NormalsSegmentation': 'false', 'Grid/MinGroundHeight': '-0.15',
                'Grid/MaxGroundHeight': '.08', 'Grid/MaxObstacleHeight': '1.8',
                'Grid/RangeMin': '.35', 'Grid/RangeMax': '4' if sensor == 'rgbd' else '12',
                'Grid/DepthDecimation': '4', 'cloud_output_voxelized': True}
