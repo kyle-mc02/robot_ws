@@ -1,9 +1,8 @@
 """Brown/black rectangular-face RGB-D detection; independent of motor control.
 
 Box axes: x along the 42 cm face edge, y along the 32 cm edge, z into the
-5.5 cm thickness. Pose origin is the box center. Broad, side and end faces
-share those axes. Unmarked faces cannot identify front/back or resolve every
-180-degree symmetry; orientation is a consistent geometric estimate.
+5.5 cm thickness. Pose origin is the box center. A symmetric unmarked face
+has a 180-degree ambiguity; this is not a uniquely identified object frame.
 """
 import math
 import heapq
@@ -19,9 +18,8 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from cv_bridge import CvBridge, CvBridgeError
-from geometry_msgs.msg import Point, PointStamped, PoseStamped, TransformStamped, Pose, Quaternion, Vector3
+from geometry_msgs.msg import Point, PointStamped, PoseStamped, TransformStamped
 from sensor_msgs.msg import Image, CameraInfo, CompressedImage
-from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import Buffer, TransformListener, StaticTransformBroadcaster, TransformException
 from tf2_geometry_msgs import do_transform_point, do_transform_pose
@@ -44,35 +42,9 @@ def depth_in_meters(depth, encoding):
     raise ValueError('Depth must be 16UC1 millimeters or 32FC1 meters')
 
 
-def pixel_rays(pixels, k, distortion):
-    """Convert image coordinates to optical-frame rays with z=1."""
-    pixels = np.asarray(pixels, np.float64).reshape(-1, 1, 2)
-    xy = cv2.undistortPoints(pixels, k, distortion).reshape(-1, 2)
-    return np.column_stack([xy, np.ones(len(xy))])
-
-
-def project_points(points, k, distortion):
-    return cv2.projectPoints(np.asarray(points), np.zeros(3), np.zeros(3), k, distortion)[0].reshape(-1, 2)
-
-
-def intersect_plane(pixels, normal, center, k, distortion):
-    """Intersect forward camera rays with a measured face plane."""
-    rays = pixel_rays(pixels, k, distortion)
-    denominator = rays @ normal
-    if np.any(denominator <= 1e-6):
-        return None
-    return rays * ((center @ normal) / denominator)[:, None]
-
-
-def face_rotation(right, normal):
-    right = right / np.linalg.norm(right)
-    down = np.cross(normal, right)
-    down /= np.linalg.norm(down)
-    return np.column_stack([right, down, normal])
-
-
 def deproject(pixel, z, k, distortion):
-    return pixel_rays(pixel, k, distortion)[0] * z
+    ray = cv2.undistortPoints(np.asarray(pixel, np.float64).reshape(1, 1, 2), k, distortion)[0, 0]
+    return np.array([ray[0] * z, ray[1] * z, z])
 
 
 class FaceDetection(tuple):
@@ -90,21 +62,6 @@ def ordered_corners(corners):
     return np.roll(corners, -np.argmin(corners.sum(axis=1)), axis=0)
 
 
-def fit_edge(points, values, transverse, minimum_span):
-    """Fit the strongest edge band, ignoring isolated gradients and short clutter."""
-    if len(values) < 5:
-        return None
-    bins = np.floor(values).astype(int)
-    origin = bins.min()
-    histogram = np.bincount(bins-origin)
-    peak = np.argmax(np.convolve(histogram, np.ones(5), mode='same')) + origin
-    selected = points[np.abs(values-peak) < 2]
-    if len(selected) < 5 or np.ptp(selected @ transverse) < minimum_span:
-        return None
-    vx, vy, x, y = cv2.fitLine(selected.astype(np.float32), cv2.DIST_HUBER, 0, .01, .01).ravel()
-    return np.array([vx, vy]), np.array([x, y])
-
-
 def fit_outer_edges(contour, seed, offset):
     box=cv2.boxPoints(cv2.minAreaRect(seed)).astype(float)
     center=box.mean(0)-offset
@@ -115,10 +72,14 @@ def fit_outer_edges(contour, seed, offset):
     for axis,sign in [(0,-1),(1,-1),(0,1),(1,1)]:
         other=1-axis;extent=[w,h][other]
         band=(np.abs(coords[:,other])<extent*.35) & (coords[:,axis]*sign > [w,h][axis]*.48)
-        line = fit_edge(pts[band], coords[band,axis], axes[:,other], extent*.3)
-        if line is None:
-            return None
-        lines.append(line)
+        subset=pts[band]; values=coords[band,axis]
+        if len(values)<5:return
+        bins=np.floor(values).astype(int);offset_bin=bins.min();hist=np.bincount(bins-offset_bin);counts=np.convolve(hist,np.ones(5),mode="same");edge=float(np.argmax(counts)+offset_bin)
+        selected=subset[np.abs(values-edge)<2]
+        if len(selected)<5:return
+        if np.ptp((selected-center)@axes[:,other])<extent*.3:return
+        vx,vy,x,y=cv2.fitLine(selected.astype(np.float32),cv2.DIST_HUBER,0,.01,.01).ravel()
+        lines.append((np.array([vx,vy]),np.array([x,y])))
     corners=[]
     for a,b in [(0,1),(1,2),(2,3),(3,0)]:
         da,pa=lines[a];db,pb=lines[b];mat=np.column_stack([da,-db])
@@ -139,33 +100,8 @@ def foreground_depth_mask(brown, depth):
     peak=int(hist.argmax())
     near=(edges[peak]+edges[peak+1])/2
     band=valid&(np.abs(z-near)<max(.18,near*.12))
-    # A plane is linear in inverse depth. Refine the loose range band using
-    # only a small, deterministic sample, so nearby separate objects are removed
-    # while a slanted face can retain its legitimate depth gradient.
-    yy,xx=np.nonzero((brown>0)&band)
-    if len(xx)>=30:
-        ids=np.linspace(0,len(xx)-1,min(150,len(xx)),dtype=int)
-        x=xx[ids]/brown.shape[1];y=yy[ids]/brown.shape[0]
-        design=np.column_stack([x,y,np.ones(len(ids))]);sample=z[yy[ids],xx[ids]]
-        rng=np.random.default_rng(7);best=None;count=0
-        for _ in range(32):
-            chosen=rng.choice(len(sample),3,replace=False)
-            if abs(np.linalg.det(design[chosen]))<1e-6:continue
-            model=np.linalg.solve(design[chosen],1/sample[chosen])
-            inverse=design@model
-            predicted=np.divide(1.,inverse,out=np.full_like(inverse,np.inf),where=inverse>0)
-            inliers=np.abs(predicted-sample)<.025
-            if inliers.sum()>count:best=inliers;count=int(inliers.sum())
-        if best is not None and count>=max(25,int(.75*len(sample))):
-            model=np.linalg.lstsq(design[best],1/sample[best],rcond=None)[0]
-            gy,gx=np.indices(z.shape)
-            inverse=model[0]*gx/brown.shape[1]+model[1]*gy/brown.shape[0]+model[2]
-            predicted=np.divide(1.,inverse,out=np.full_like(inverse,np.inf),where=inverse>0)
-            band=valid&(np.abs(z-predicted)<.035)&(np.abs(z-near)<.55)
-    # One pixel at the reduced resolution covers RGB/depth edge registration.
-    # Select this band globally before applying any tracking crop.
+    # Only bridge tiny missing-depth gaps, not depth jumps to other objects.
     return cv2.dilate(band.astype(np.uint8),np.ones((3,3),np.uint8))>0
-
 
 
 def three_visible_edges(points, seed, offset):
@@ -178,10 +114,16 @@ def three_visible_edges(points, seed, offset):
     for axis,sign in [(0,-1),(1,-1),(0,1)]:
         other=1-axis
         band=(np.abs(coords[:,other])<[w,h][other]*.35)&(coords[:,axis]*sign>[w,h][axis]*.42)
-        line = fit_edge(pts[band], coords[band,axis], np.eye(2)[other], [w,h][other]*.3)
-        if line is None:
-            return None
-        lines.append(line)
+        selected=pts[band];values=coords[band,axis]
+        if len(values)<5:return None
+        bins=np.floor(values).astype(int);origin=bins.min()
+        hist=np.bincount(bins-origin)
+        peak=np.argmax(np.convolve(hist,np.ones(5),mode='same'))+origin
+        selected=selected[np.abs(values-peak)<2]
+        if len(selected)<5:return None
+        if np.ptp(selected[:,other])<[w,h][other]*.3:return None
+        vx,vy,px,py=cv2.fitLine(selected.astype(np.float32),cv2.DIST_HUBER,0,.01,.01).ravel()
+        lines.append((np.array([vx,vy]),np.array([px,py])))
     corners=[]
     for a,b in [(0,1),(1,2)]:
         da,pa=lines[a];db,pb=lines[b];matrix=np.column_stack([da,-db])
@@ -190,58 +132,17 @@ def three_visible_edges(points, seed, offset):
     return np.array(corners),lines
 
 
-def interior_support(corners, brown, dark, foreground=None):
-    """Score 32x24 interior samples; tolerate a small occlusion, not a large gap.
-
-    Brown and nearby dark markings are appearance support. When available,
-    the depth-selected surface is required as well. Image-clipped samples
-    are unobserved rather than background.
-    """
-    corners=np.asarray(corners,np.float32)
-    if not np.isfinite(corners).all() or not cv2.isContourConvex(corners):return None
-    transform=cv2.getPerspectiveTransform(np.array([[0,0],[1,0],[1,1],[0,1]],np.float32),corners)
-    gx,gy=np.meshgrid(np.linspace(.06,.94,32),np.linspace(.06,.94,24))
-    uv=cv2.perspectiveTransform(np.stack([gx,gy],axis=-1).astype(np.float32),transform)
-    h,w=brown.shape
-    visible=(uv[:,:,0]>=0)&(uv[:,:,0]<=w-1)&(uv[:,:,1]>=0)&(uv[:,:,1]<=h-1)
-    if visible.sum()<96:return None
-    x=np.clip(np.rint(uv[:,:,0]).astype(int),0,w-1)
-    y=np.clip(np.rint(uv[:,:,1]).astype(int),0,h-1)
-    brown_samples=brown[y,x]>0
-    matches=brown_samples|(dark[y,x]>0)
-    if foreground is not None:matches &= foreground[y,x]
-    coverage=float(matches[visible].mean())
-    brown_fraction=float(brown_samples[visible].mean())
-    bad=(visible&~matches).astype(np.uint8)
-    count,_,stats,_=cv2.connectedComponentsWithStats(bad,8)
-    largest=float(stats[1:,cv2.CC_STAT_AREA].max()/visible.sum()) if count>1 else 0.
-    if coverage<.82 or brown_fraction<.18 or largest>.18:return None
-    return dict(score=coverage-.8*largest,
-                coverage=coverage,largest_gap=largest)
-
-
-def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None, depth=None, search_region=None):
+def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None, depth=None):
     """HSV locates brown; recover surrounding dark borders in a small local ROI."""
     scale = min(1.0, 320.0 / bgr.shape[1])
     small = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else bgr
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     brown = cv2.inRange(hsv, np.array(hsv_low, np.uint8), np.array(hsv_high, np.uint8))
     foreground=foreground_depth_mask(brown,depth) if depth is not None else None
-    if search_region is not None:
-        left,top,right,bottom=np.rint(np.asarray(search_region)*scale).astype(int)
-        restricted=np.zeros_like(brown)
-        restricted[top:bottom,left:right]=brown[top:bottom,left:right]
-        brown=restricted
     if foreground is not None:
         brown[~foreground]=0
     mask = cv2.morphologyEx(brown, cv2.MORPH_OPEN, np.ones((3,3),np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5),np.uint8))
-    # Dark pixels must be close to brown evidence. An attached sleeve must
-    # not turn into an unlimited extension of the black border.
-    nearby=cv2.dilate(brown,np.ones((31,31),np.uint8))>0
-    dark=((hsv[:,:,2]<105)&nearby).astype(np.uint8)*255
-    if foreground is not None:dark[~foreground]=0
-    best_detection=None;best_score=-float('inf')
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     ranked = ((cv2.contourArea(c), i) for i, c in enumerate(contours))
     for area, index in heapq.nlargest(10, ranked, key=lambda item: item[0]):
@@ -252,8 +153,9 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None, depth=None, sea
         pad = max(5, int(min(w,h)*0.25))
         x0, y0 = max(0,x-pad), max(0,y-pad)
         x1, y1 = min(small.shape[1],x+w+pad), min(small.shape[0],y+h+pad)
+        roi = hsv[y0:y1,x0:x1]
         # Include nearby dark frame, but not pale floor merely sharing brown hue.
-        combined = ((brown[y0:y1,x0:x1] > 0) | (dark[y0:y1,x0:x1]>0)).astype(np.uint8)*255
+        combined = ((brown[y0:y1,x0:x1] > 0) | (roi[:,:,2] < 105)).astype(np.uint8)*255
         if foreground is not None:
             combined[~foreground[y0:y1,x0:x1]]=0
         combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((3,3),np.uint8))
@@ -264,7 +166,7 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None, depth=None, sea
             if cv2.pointPolygonTest(contour,seed_center,False) < 0:
                 continue
             hull = cv2.convexHull(contour)
-            if not 0.85*area <= cv2.contourArea(hull) <= 1.8*area:
+            if not 0.85*area <= cv2.contourArea(hull) <= 2.8*area:
                 continue
             for epsilon in (0.015,0.025,0.04):
                 quad = cv2.approxPolyDP(hull,epsilon*cv2.arcLength(hull,True),True)
@@ -273,18 +175,16 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None, depth=None, sea
                     if (np.any(global_quad[:,0]<=1) or np.any(global_quad[:,1]<=1)
                             or np.any(global_quad[:,0]>=small.shape[1]-2) or np.any(global_quad[:,1]>=small.shape[0]-2)):
                         continue  # Image-clipped/background contours cannot supply four face corners.
-                    support=interior_support(ordered_corners(global_quad),brown,dark,foreground)
-                    if support is not None:
-                        candidates.append((support['score'],global_quad))
+                    candidates.append((cv2.contourArea(quad),global_quad))
                     break
-        edges = cv2.Canny(cv2.cvtColor(small[y0:y1,x0:x1], cv2.COLOR_BGR2GRAY), 40, 100)
-        if foreground is not None:
-            edges[~foreground[y0:y1,x0:x1]] = 0
         pose_corners = None
         if candidates:
             pose_corners = ordered_corners(max(candidates,key=lambda q:q[0])[1]/scale)
             corners = pose_corners
         else:
+            edges = cv2.Canny(cv2.cvtColor(small[y0:y1,x0:x1],cv2.COLOR_BGR2GRAY),40,100)
+            if foreground is not None:
+                edges[~foreground[y0:y1,x0:x1]]=0
             edge_points = cv2.findNonZero(edges)
             fitted = fit_outer_edges(edge_points,seed,np.array([x0,y0])) if edge_points is not None else None
             if fitted is not None:
@@ -293,8 +193,10 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None, depth=None, sea
                         and cv2.contourArea(candidate.astype(np.float32)) < area/scale**2*2.0):
                     pose_corners = candidate
             corners = pose_corners if pose_corners is not None else ordered_corners(cv2.boxPoints(cv2.minAreaRect(seed))/scale)
-        support=interior_support(corners*scale,brown,dark,foreground)
-        if support is None:continue
+        if pose_corners is None:
+            # Detection survives irregular contours; never feed synthetic rectangle
+            # corners to PnP as if they were physical perspective corners.
+            corners = ordered_corners(cv2.boxPoints(cv2.minAreaRect(seed))/scale)
         homography = cv2.getPerspectiveTransform(
             np.array([[0,0],[1,0],[1,1],[0,1]],np.float32),corners.astype(np.float32))
         pixel = cv2.perspectiveTransform(np.array([[[0.5,0.5]]],np.float32),homography)[0,0].astype(np.float64)
@@ -308,19 +210,17 @@ def detect_face(bgr, hsv_low, hsv_high, minimum_area, warn=None, depth=None, sea
         detection.top_edge=None
         # Do not mistake a clipped frame boundary for a physical box edge.
         if y+h>=small.shape[0]-2 and y>2 and x>2 and x+w<small.shape[1]-2:
-            points=cv2.findNonZero(edges)
+            local_edges=cv2.Canny(cv2.cvtColor(small[y0:y1,x0:x1],cv2.COLOR_BGR2GRAY),40,100)
+            if foreground is not None:
+                local_edges[~foreground[y0:y1,x0:x1]]=0
+            points=cv2.findNonZero(local_edges)
             partial=three_visible_edges(points,seed,np.array([x0,y0])) if points is not None else None
             if partial is not None:
                 detection.top_edge=partial[0]/scale
                 detection.side_lines=[(v,pt/scale+np.array([x0,y0])/scale) for v,pt in (partial[1][0],partial[1][2])]
                 detection.pose_corners=None
-        # Compare candidates across seeds rather than returning the largest
-        # connected component. Area is deliberately absent from this score.
-        if support['score']>best_score:
-            best_score=support['score'];best_detection=detection
-            detection.interior=support
-            detection.appearance=(brown,dark,scale)
-    return best_detection
+        return detection
+    return None
 
 
 def fit_surface_plane(samples, tolerance):
@@ -352,35 +252,28 @@ def fit_surface_plane(samples, tolerance):
     return clean,normal,center
 
 
-def surface_samples(depth, detection, k, distortion, grid=24, erosion=0, max_depth=8.):
-    """Sample at most 150 interior depths; share the same bounded geometry work."""
-    polygon, x0, y0 = detection[2]
-    roi = depth[y0:y0+polygon.shape[0], x0:x0+polygon.shape[1]]
-    if erosion:
-        polygon = cv2.erode(polygon, np.ones((erosion, erosion), np.uint8),
-                            borderType=cv2.BORDER_CONSTANT, borderValue=0)
-    xx, yy = np.meshgrid(np.linspace(0, roi.shape[1]-1, min(grid, roi.shape[1]), dtype=int),
-                         np.linspace(0, roi.shape[0]-1, min(grid, roi.shape[0]), dtype=int))
-    z = roi[yy, xx]
-    valid = (polygon[yy, xx] > 0) & np.isfinite(z) & (z > .1) & (z < max_depth)
-    xx, yy = xx[valid], yy[valid]
-    if len(xx) < 20:
-        return np.empty((0, 3))
-    ids = np.linspace(0, len(xx)-1, min(150, len(xx)), dtype=int)
-    xx, yy = xx[ids], yy[ids]
-    return pixel_rays(np.column_stack([xx+x0, yy+y0]), k, distortion) * roi[yy, xx, None]
-
-
 def estimate_bottom_clipped(depth,k,distortion,dimensions,detection,tolerance,warn=None):
     """Infer only the hidden bottom using a depth plane, measured top, and known size."""
-    samples = surface_samples(depth, detection, k, distortion, erosion=5)
-    plane = fit_surface_plane(samples, tolerance)
+    _,_,(polygon,x0,y0)=detection
+    roi=depth[y0:y0+polygon.shape[0],x0:x0+polygon.shape[1]]
+    grid_x=np.linspace(0,roi.shape[1]-1,min(24,roi.shape[1]),dtype=int)
+    grid_y=np.linspace(0,roi.shape[0]-1,min(24,roi.shape[0]),dtype=int)
+    xx,yy=np.meshgrid(grid_x,grid_y)
+    eroded=cv2.erode(polygon,np.ones((5,5),np.uint8),borderType=cv2.BORDER_CONSTANT,borderValue=0)
+    valid=(eroded[yy,xx]>0)&np.isfinite(roi[yy,xx])&(roi[yy,xx]>.1)&(roi[yy,xx]<8.)
+    xx,yy=xx[valid],yy[valid]
+    if len(xx)<20:return None
+    indices=np.linspace(0,len(xx)-1,min(150,len(xx)),dtype=int);xx,yy=xx[indices],yy[indices]
+    z=roi[yy,xx]
+    xy=cv2.undistortPoints(np.column_stack([xx+x0,yy+y0]).astype(float).reshape(-1,1,2),k,distortion).reshape(-1,2)
+    samples=np.column_stack([xy*z[:,None],z]);plane=fit_surface_plane(samples,tolerance)
     if plane is None:return None
     _,normal,plane_center=plane
     top=detection.top_edge
-    top_xyz = intersect_plane(top, normal, plane_center, k, distortion)
-    if top_xyz is None:
-        return None
+    xy=cv2.undistortPoints(top.reshape(-1,1,2),k,distortion).reshape(-1,2)
+    rays=np.column_stack([xy,np.ones(2)]);denom=rays@normal
+    if np.any(denom<=1e-6):return None
+    top_xyz=rays*((plane_center@normal)/denom)[:,None]
     edge=top_xyz[1]-top_xyz[0];length=np.linalg.norm(edge)
     width,height,thickness=dimensions
     errors=np.abs(length/np.array([width,height])-1.)
@@ -391,7 +284,7 @@ def estimate_bottom_clipped(depth,k,distortion,dimensions,detection,tolerance,wa
     xyz=np.array([top_xyz[0],top_xyz[1],top_xyz[1]+down*vertical,top_xyz[0]+down*vertical])
     if not np.isfinite(xyz).all() or np.any(xyz[:,2]<=0.1):
         return None
-    corners=project_points(xyz, k, distortion)
+    corners=cv2.projectPoints(xyz,np.zeros(3),np.zeros(3),k,distortion)[0].reshape(-1,2)
     if not np.isfinite(corners).all() or np.min(corners[2:,1])<depth.shape[0]-3:
         return None  # The inferred edge must actually lie outside the visible image.
     # Both measured side lines must agree with the inferred lower corners.
@@ -401,8 +294,9 @@ def estimate_bottom_clipped(depth,k,distortion,dimensions,detection,tolerance,wa
             return None
     surface=xyz.mean(axis=0)
     axis_x=right if axis==0 else down
-    rotation = face_rotation(axis_x, normal)
-    pixel=project_points(surface[None], k, distortion)[0]
+    axis_y=np.cross(normal,axis_x);axis_y/=np.linalg.norm(axis_y)
+    rotation=np.column_stack([axis_x,axis_y,normal])
+    pixel=cv2.projectPoints(surface[None],np.zeros(3),np.zeros(3),k,distortion)[0].ravel()
     return {'corners_camera':xyz,'pixel':pixel,'surface':surface,
             'center':surface+normal*thickness/2,'rotation':rotation,'corners':corners,
             'pose_source':'depth_plane_known_size_bottom_clipped'}
@@ -439,34 +333,61 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     width, height, thickness = dimensions
     object_points = np.array([[-width/2, -height/2, 0], [width/2, -height/2, 0],
                               [width/2, height/2, 0], [-width/2, height/2, 0]], np.float64)
-    samples = surface_samples(depth, detection, k, distortion, grid=32, erosion=7, max_depth=10.)
-    if len(samples) < 20:
-        return reject('fewer than 20 valid interior depth samples')
+    # Interior RGB-D surface samples disambiguate planar PnP solutions.
+    eroded = cv2.erode(polygon, np.ones((7, 7), np.uint8),
+                       borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    # Validate at most 32x32 evenly distributed candidates instead of scanning
+    # every depth pixel and building potentially huge coordinate arrays.
+    grid_x = np.linspace(0, polygon.shape[1]-1, min(32, polygon.shape[1]), dtype=int)
+    grid_y = np.linspace(0, polygon.shape[0]-1, min(32, polygon.shape[0]), dtype=int)
+    xx, yy = np.meshgrid(grid_x, grid_y)
+    candidate_z = depth_roi[yy, xx]
+    valid = (eroded[yy, xx] > 0) & np.isfinite(candidate_z) & (candidate_z > 0.1) & (candidate_z < 10.)
+    xx, yy = xx[valid], yy[valid]
+    if len(xx) < 20:
+        return reject(f'interior depth grid has {len(xx)} valid samples; need >=20 '
+                      f'(checked {candidate_z.size} grid locations)')
+    indices = np.linspace(0, len(xx)-1, min(150, len(xx)), dtype=int)
+    samples_uv = np.column_stack([xx[indices]+x0, yy[indices]+y0]).astype(np.float64)
+    rays = cv2.undistortPoints(samples_uv.reshape(-1, 1, 2), k, distortion).reshape(-1, 2)
+    sample_z = depth_roi[yy[indices], xx[indices]]
+    samples = np.column_stack([rays * sample_z[:, None], sample_z])
     plane = fit_surface_plane(samples, depth_tolerance)
     if plane is None:
         return reject('depth does not support one dominant flat face; use the closed patterned side')
     samples, measured_normal, measured_center = plane
     best = None
+    rejections = []
     for shift in range(2):  # 180-degree alternatives are symmetry-equivalent.
         image_points = np.ascontiguousarray(np.roll(corners, shift, axis=0))
         result = cv2.solvePnPGeneric(object_points, image_points, k, distortion, flags=cv2.SOLVEPNP_IPPE)
         if not result[0]:
+            rejections.append(f'corner shift {shift}: PnP returned no solutions')
             continue
-        for rvec, tvec in zip(result[1], result[2]):
+        for candidate, (rvec, tvec) in enumerate(zip(result[1], result[2])):
+            label = f'shift {shift}, candidate {candidate}'
             rotation, _ = cv2.Rodrigues(rvec)
             translation = tvec.ravel()
             normal = rotation[:, 2]
             if translation[2] <= 0 or np.dot(normal, translation) <= 0:
+                rejections.append(f'{label}: invalid face direction / behind camera '
+                                  f'(z={translation[2]:.3f} m, normal dot position={np.dot(normal, translation):.3f})')
                 continue
             projected, _ = cv2.projectPoints(object_points, rvec, tvec, k, distortion)
             error = float(np.sqrt(np.mean(np.sum((projected.reshape(-1, 2)-image_points)**2, axis=1))))
             plane_error = float(np.median(np.abs((samples-translation) @ normal)))
             if np.dot(normal, measured_normal) < math.cos(math.radians(20)):
+                rejections.append(f'{label}: pose normal disagrees with measured depth plane')
                 continue
             if error > reprojection_limit or plane_error > depth_tolerance:
+                rejections.append(f'{label}: reprojection={error:.2f} px '
+                                  f'(limit {reprojection_limit:.2f}), plane depth error={plane_error:.4f} m '
+                                  f'(limit {depth_tolerance:.4f})')
                 continue
             center_error = float(abs(np.dot(surface-translation, normal)))
             if center_error > depth_tolerance:
+                rejections.append(f'{label}: center depth error={center_error:.4f} m '
+                                  f'(limit {depth_tolerance:.4f})')
                 continue
             # Stable image-corner convention breaks indistinguishable symmetry ties.
             score = error + 100 * plane_error
@@ -475,9 +396,13 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
     if best is None:
         # RGB-D alternative: intersect true image corners with the measured plane.
         # Validate physical edge lengths and orthogonality, instead of weakening PnP.
-        xyz = intersect_plane(corners, measured_normal, measured_center, k, distortion)
-        if xyz is None:
+        xy=cv2.undistortPoints(corners.reshape(-1,1,2),k,distortion).reshape(-1,2)
+        rays=np.column_stack([xy,np.ones(4)])
+        denom=rays@measured_normal
+        if np.any(denom<=1e-6):
             return reject('face-corner rays are inconsistent with depth plane')
+        depths=(measured_center@measured_normal)/denom
+        xyz=rays*depths[:,None]
         lengths=np.linalg.norm(np.roll(xyz,-1,axis=0)-xyz,axis=1)
         for shift in range(2):
             pts=np.roll(xyz,shift,axis=0)
@@ -488,266 +413,36 @@ def estimate_target(bgr, depth, k, distortion, dimensions, hsv_low, hsv_high,
                 continue
             if abs(np.dot(edge_x,edge_y)/np.prod(measured))>0.15:
                 continue
-            rotation = face_rotation(edge_x, measured_normal)
-            if rotation[:, 1] @ edge_y < 0:
+            axis_x=edge_x/np.linalg.norm(edge_x)
+            axis_y=np.cross(measured_normal,axis_x)
+            axis_y/=np.linalg.norm(axis_y)
+            if axis_y@edge_y<0:
                 continue
+            rotation=np.column_stack([axis_x,axis_y,measured_normal])
             center=xyz.mean(axis=0)+measured_normal*thickness/2
             best=(0.,center,rotation)
             break
         if best is None:
             return reject('PnP failed and measured face edges do not match known dimensions '
-                          f'(edges {np.round(lengths,3).tolist()} m)')
+                          f'(edges {np.round(lengths,3).tolist()} m); '+'; '.join(rejections))
     normal = best[2][:, 2]
     # Refine range with measured depth after validating the known face dimensions.
+    # Brown segmentation can sit just inside a dark border; do not let that
+    # small corner-size error bias the otherwise directly measured depth.
     face_center = best[1] - normal * thickness/2
-    center = best[1] + normal * np.median((samples-face_center) @ normal)
-    corners_camera = intersect_plane(corners, normal, center-normal*thickness/2, k, distortion)
-    if corners_camera is None or np.any(corners_camera[:, 2] <= 0):
-        return reject('face corners are parallel to the plane or behind the camera')
-    return {'corners_camera': corners_camera, 'pixel': pixel, 'surface': surface, 'center': center, 'rotation': best[2], 'corners': corners}
-
-
-def face_model(rotation,dimensions,kind):
-    """Visible-face axes expressed in the fixed physical box frame."""
-    width,height,thickness=dimensions
-    if kind=='side':
-        basis=np.array([[0,0,1],[0,1,0],[-1,0,0]],float)
-        return rotation@basis,np.array([thickness,height,width])
-    if kind=='end':
-        basis=np.array([[1,0,0],[0,0,1],[0,-1,0]],float)
-        return rotation@basis,np.array([width,thickness,height])
-    return rotation,np.asarray(dimensions)
-
-
-def pose_geometry(center, rotation, dimensions, k, distortion, **metadata):
-    """One fixed-size model supplies outline, center marker and reported pose."""
-    face_kind=metadata.get('face_kind','broad')
-    local_rotation,local_dimensions=face_model(rotation,dimensions,face_kind)
-    width,height,thickness=local_dimensions
-    face=center-local_rotation[:,2]*thickness/2
-    signs=np.array([[-1,-1],[1,-1],[1,1],[-1,1]],float)
-    xyz=face+signs[:,:1]*local_rotation[:,0]*width/2+signs[:,1:]*local_rotation[:,1]*height/2
-    if not np.isfinite(xyz).all() or np.any(xyz[:,2]<=.05):return None
-    pixels=project_points(np.vstack([xyz, face]), k, distortion)
-    return dict(center=center,rotation=rotation,surface=face,corners_camera=xyz,
-                corners=pixels[:4],pixel=pixels[4],**metadata)
-
-
-def candidate_plane(depth,detection,k,distortion,tolerance=.04):
-    cached=getattr(detection,'plane',None)
-    if cached is not None:return cached
-    return fit_surface_plane(surface_samples(depth, detection, k, distortion), tolerance)
-
-
-def fit_visible_face(bgr,depth,k,distortion,dimensions,detection,measurement=None,previous=None):
-    """Sparse fixed-size local search scored against depth AND visible RGB edges.
-
-    Unlike the other branch's all-angle image correlations, project only a
-    bounded set of model samples. Off-image samples are unobserved, not empty.
-    """
-    plane=candidate_plane(depth,detection,k,distortion)
-    if plane is None:return None
-    _,normal,plane_center=plane
-    width,height,thickness=dimensions
-    corners=detection[0]
-    observed_xyz = intersect_plane(corners, normal, plane_center, k, distortion)
-    if observed_xyz is None:
-        return None
-    edge=(observed_xyz[1]-observed_xyz[0]+observed_xyz[2]-observed_xyz[3])/2
-    edge-=normal*(edge@normal)
-    if np.linalg.norm(edge)<1e-6:return None
-    ex=edge/np.linalg.norm(edge);ey=np.cross(normal,ex)
-    seeds=[]
-    if measurement is not None:
-        seeds.append((measurement['surface'],measurement['rotation'][:,0],True))
-    else:
-        for axis in (ex,ey):
-            down=np.cross(normal,ex)
-            center=observed_xyz.mean(axis=0)
-            # Use the measured top to initialize a bottom-clipped face.
-            if getattr(detection,'top_edge',None) is not None:
-                top_xyz = intersect_plane(detection.top_edge, normal, plane_center, k, distortion)
-                if top_xyz is None:
-                    continue
-                vertical=height if abs(axis@ex)>.9 else width
-                center=top_xyz.mean(axis=0)+down*vertical/2
-            seeds.append((center,axis,False))
-    if previous is not None:
-        seeds.append((previous['surface'],previous['rotation'][:,0],True))
-    h,w=depth.shape
-    allow_partial=bool(getattr(detection,'top_edge',None) is not None or
-                       np.any(corners[:,0]<3) or np.any(corners[:,0]>w-4) or
-                       np.any(corners[:,1]<3) or np.any(corners[:,1]>h-4))
-    # Restrict edge computation to the candidate neighborhood.
-    x0=max(0,int(corners[:,0].min())-30);x1=min(w,int(corners[:,0].max())+31)
-    y0=max(0,int(corners[:,1].min())-30);y1=min(h,int(corners[:,1].max())+31)
-    if x1<=x0 or y1<=y0:return None
-    gray=cv2.cvtColor(bgr[y0:y1,x0:x1],cv2.COLOR_BGR2GRAY)
-    scale=min(1.,320./gray.shape[1])
-    if scale<1:gray=cv2.resize(gray,None,fx=scale,fy=scale,interpolation=cv2.INTER_AREA)
-    edges=cv2.Canny(gray,40,100)
-    distances=cv2.distanceTransform(255-edges,cv2.DIST_L2,3)
-    # 35 face-interior samples and 64 edge samples, independent of image area.
-    gx,gy=np.meshgrid(np.linspace(-.42,.42,7)*width,np.linspace(-.42,.42,5)*height)
-    interior=np.column_stack([gx.ravel(),gy.ravel()])
-    unit=np.linspace(-.5,.5,16)
-    border=np.vstack([np.column_stack([unit*width,np.full(16,-height/2)]),
-                      np.column_stack([np.full(16,width/2),unit*height]),
-                      np.column_stack([unit*width,np.full(16,height/2)]),
-                      np.column_stack([np.full(16,-width/2),unit*height])])
-    local=np.vstack([interior,border])
-    centers=[];rotations=[];priors=[]
-    for center,axis,anchored in seeds:
-        axis=axis-normal*(axis@normal);axis/=np.linalg.norm(axis)
-        other=np.cross(normal,axis)
-        center=center-normal*((center-plane_center)@normal)
-        angles=(-3.,0.,3.) if anchored else (-12.,-6.,0.,6.,12.)
-        radius=.015 if anchored else .03
-        for degrees in angles:
-            angle=math.radians(degrees)
-            rx=math.cos(angle)*axis+math.sin(angle)*other;ry=np.cross(normal,rx)
-            for dx in (-radius,0.,radius):
-                for dy in (-radius,0.,radius):
-                    centers.append(center+rx*dx+ry*dy)
-                    rotations.append(np.column_stack([rx,ry,normal]))
-                    priors.append((dx/radius)**2+(dy/radius)**2+(degrees/12.)**2)
-    centers=np.asarray(centers);rotations=np.asarray(rotations)
-    xyz=centers[:,None,:]+local[None,:,0,None]*rotations[:,None,:,0]+local[None,:,1,None]*rotations[:,None,:,1]
-    pixels=project_points(xyz.reshape(-1, 3), k, distortion).reshape(len(centers), -1, 2)
-    # Reuse the configured appearance masks from detection.
-    appearance=getattr(detection,'appearance',None)
-    best=None
-    for i,(points,uv) in enumerate(zip(xyz,pixels)):
-        if np.any(points[:,2]<=.1) or not np.isfinite(uv).all():continue
-        visible=(uv[:,0]>=0)&(uv[:,0]<w-1)&(uv[:,1]>=0)&(uv[:,1]<h-1)
-        inside=visible[:len(interior)]
-        if inside.sum()<12 or (not allow_partial and inside.mean()<.98):continue
-        loc=np.rint(uv[:len(interior)][inside]).astype(int)
-        z=depth[loc[:,1],loc[:,0]]
-        residual=np.abs(z-points[:len(interior)][inside,2])
-        good=np.isfinite(z)&(z>.1)&(residual<.025)
-        coverage=good.mean()
-        if coverage<.75:continue
-        appearance_error=0.
-        if appearance is not None:
-            brown_mask,dark_mask,appearance_scale=appearance
-            samples=np.rint(uv[:len(interior)][inside]*appearance_scale).astype(int)
-            samples[:,0]=np.clip(samples[:,0],0,brown_mask.shape[1]-1)
-            samples[:,1]=np.clip(samples[:,1],0,brown_mask.shape[0]-1)
-            color_good=(brown_mask[samples[:,1],samples[:,0]]>0)|(dark_mask[samples[:,1],samples[:,0]]>0)
-            if (color_good&good).mean()<.75:continue
-            appearance_error=2*(1-color_good.mean())
-        projected=(uv[len(interior):]-[x0,y0])*scale
-        edge_visible=visible[len(interior):]&(projected[:,0]>=0)&(projected[:,0]<distances.shape[1]-1)&(projected[:,1]>=0)&(projected[:,1]<distances.shape[0]-1)
-        if edge_visible.sum()<20:continue
-        loc=np.rint(projected[edge_visible]).astype(int)
-        edge_error=np.minimum(distances[loc[:,1],loc[:,0]]/scale,15).mean()
-        if edge_error>7.:continue
-        score=float(edge_error+8*(1-coverage)+.25*priors[i]+appearance_error)
-        # Strong measured borders should anchor position, not merely plane occupancy.
-        if measurement is not None:
-            score+=float(np.linalg.norm(centers[i]-measurement['surface']))*60
-        if best is None or score<best[0]:best=(score,i,coverage,float(edge_error))
-    if best is None:return None
-    score,i,coverage,edge_error=best
-    source=measurement.get('pose_source','measured_edges') if measurement else 'fixed_face_local_fit'
-    return pose_geometry(centers[i]+normal*thickness/2,rotations[i],dimensions,k,distortion,
-                         score=score,coverage=coverage,edge_error=edge_error,pose_source=source)
-
-
-def fixed_face_fit(bgr,depth,k,distortion,dimensions,detection,measurement=None,previous=None):
-    """Try real cuboid faces; a narrow edge is not a malformed broad face.
-
-    Plain brown faces use their silhouette and depth, without requiring stripes.
-    Each returned rotation still describes the same physical box axes.
-    """
-    result=fit_visible_face(bgr,depth,k,distortion,dimensions,detection,measurement,previous
-                           if previous is not None and previous.get('face_kind','broad')=='broad' else None)
-    if result is not None:
-        result['face_kind']='broad'
-        return result
-    best=None
-    for kind in ('side','end'):
-        basis,local_dimensions=face_model(np.eye(3),dimensions,kind)
-        if getattr(detection,'pose_corners',None) is not None:
-            plane=candidate_plane(depth,detection,k,distortion)
-            if plane is None:continue
-            _,normal,center=plane
-            xyz = intersect_plane(detection[0], normal, center, k, distortion)
-            if xyz is None:
-                continue
-            lengths=np.linalg.norm(np.roll(xyz,-1,axis=0)-xyz,axis=1)
-            measured=np.sort([(lengths[0]+lengths[2])/2,(lengths[1]+lengths[3])/2])
-            if np.any(np.abs(measured/np.sort(local_dimensions[:2])-1)>.18):continue
-        local=fit_visible_face(bgr,depth,k,distortion,local_dimensions,detection)
-        if local is None:continue
-        # Full silhouettes must agree in area as well as interior depth. This
-        # prevents a small face from fitting somewhere inside a larger object.
-        if getattr(detection,'top_edge',None) is None:
-            observed=cv2.contourArea(detection[0].astype(np.float32))
-            predicted=cv2.contourArea(local['corners'].astype(np.float32))
-            if observed<=0 or not .85< predicted/observed <1.2:continue
-        local['rotation']=local['rotation']@basis.T
-        local['face_kind']=kind
-        local['pose_source']='depth_plane_known_size_'+kind
-        if best is None or local['score']<best['score']:best=local
-    return best
-
-
-class PoseTracker:
-    """Time-aware smoothing and motion gates; reject inconsistent jumps."""
-    def __init__(self):
-        self.result=None;self.stamp=None;self.pending=None;self.failures=0
-
-    def search_region(self,k,distortion,dimensions,stamp,shape):
-        if self.failures>=2 or self.result is None or stamp-self.stamp>1.0 or stamp<=self.stamp:return None
-        result=pose_geometry(self.result['center'],self.result['rotation'],dimensions,k,distortion,face_kind=self.result.get('face_kind','broad'))
-        if result is None:return None
-        corners=result['corners'];lo=corners.min(axis=0);hi=corners.max(axis=0)
-        margin=np.maximum(35.,(hi-lo)*.4)
-        return (max(0,int(lo[0]-margin[0])),max(0,int(lo[1]-margin[1])),
-                min(shape[1],int(hi[0]+margin[0])+1),min(shape[0],int(hi[1]+margin[1])+1))
-
-    def update(self,result,stamp,dimensions,k,distortion):
-        self.failures=0
-        if self.stamp is not None and stamp<=self.stamp:return None
-        if self.result is None or stamp-self.stamp>1.0:
-            self.result=result;self.stamp=stamp;self.pending=None;return result
-        dt=stamp-self.stamp
-        old=self.result
-        rotation=result['rotation']
-        kind=result.get('face_kind','broad')
-        basis,_=face_model(np.eye(3),dimensions,kind)
-        symmetry=basis@np.diag([-1.,-1.,1.])@basis.T
-        alternatives=[rotation,rotation@symmetry]
-        def angle(r):return math.acos(float(np.clip((np.trace(old['rotation'].T@r)-1)/2,-1,1)))
-        rotation=min(alternatives,key=angle)
-        if np.linalg.norm(result['center']-old['center'])>.04+dt*.8 or angle(rotation)>math.radians(15+90*dt):
-            if (self.pending is None or np.linalg.norm(result['center']-self.pending['center'])>.04+dt*.8
-                    or math.acos(float(np.clip((np.trace(self.pending['rotation'].T@rotation)-1)/2,-1,1)))>math.radians(20)):
-                self.pending=result;return None
-            self.result=result;self.stamp=stamp;self.pending=None;return result
-        tau=.1 if result.get('edge_error',99)<3 else .2
-        alpha=1-math.exp(-dt/tau)
-        center=old['center']*(1-alpha)+result['center']*alpha
-        mixed=old['rotation']*(1-alpha)+rotation*alpha
-        u,_,vt=np.linalg.svd(mixed)
-        rotation=u@np.diag([1.,1.,np.linalg.det(u@vt)])@vt
-        metadata={key:result[key] for key in ('score','coverage','edge_error','pose_source','face_kind') if key in result}
-        smooth=pose_geometry(center,rotation,dimensions,k,distortion,**metadata)
-        self.result=smooth;self.stamp=stamp;self.pending=None
-        return smooth
-
-
-def make_marker(header, namespace, identifier, kind, scale, color, *, pose=None, points=(), lifetime=.5):
-    """Common RViz defaults; callers specify only the visual's actual contents."""
-    marker = Marker(header=header, ns=namespace, id=identifier, type=kind, action=Marker.ADD,
-                    pose=pose if pose is not None else Pose(orientation=Quaternion(w=1.)),
-                    scale=Vector3(x=float(scale[0]), y=float(scale[1]), z=float(scale[2])),
-                    color=ColorRGBA(r=color[0], g=color[1], b=color[2], a=color[3]), points=list(points))
-    marker.lifetime.sec = int(lifetime)
-    marker.lifetime.nanosec = int((lifetime-int(lifetime))*1e9)
-    return marker
+    depth_correction = normal * np.median((samples-face_center) @ normal)
+    best = (best[0], best[1] + depth_correction, best[2])
+    face_center = best[1] - normal * thickness/2
+    corner_rays = cv2.undistortPoints(corners.reshape(-1, 1, 2), k, distortion).reshape(-1, 2)
+    corner_rays = np.column_stack([corner_rays, np.ones(4)])
+    denominator = corner_rays @ normal
+    if np.any(np.abs(denominator) < 1e-6):
+        return reject('corner viewing ray is nearly parallel to the estimated face plane')
+    corner_depths = np.dot(face_center, normal) / denominator
+    if np.any(corner_depths <= 0):
+        return reject(f'estimated face corners lie behind camera: depths={corner_depths.tolist()} m')
+    corners_camera = corner_rays * corner_depths[:, None]
+    return {'corners_camera': corners_camera, 'pixel': pixel, 'surface': surface, 'center': best[1], 'rotation': best[2], 'corners': corners}
 
 
 class Perception(Node):
@@ -763,11 +458,13 @@ class Perception(Node):
             'box_dimensions': [0.42, 0.32, 0.055],
             'brown_hsv_low': [0, 50, 20], 'brown_hsv_high': [40, 255, 255],
             'min_contour_area': 1200.0,
-            'processing_rate_hz': 6.0,
+            'processing_rate_hz': 3.0,
             'capture_next_frame': False, 'capture_directory': '~/robot_ws/perception_captures',
             'depth_tolerance': 0.04, 'max_reprojection_error': 4.0}
-        parameters = self.declare_parameters('', list(defaults.items()))
-        self.values = {parameter.name: parameter.value for parameter in parameters}
+        self.values = {}
+        for name, value in defaults.items():
+            self.declare_parameter(name, value)
+            self.values[name] = self.get_parameter(name).value
         p = self.values
         self.dimensions = np.asarray(p['box_dimensions'], np.float64)
         if self.dimensions.shape != (3,) or not np.isfinite(self.dimensions).all() or np.any(self.dimensions <= 0):
@@ -790,7 +487,6 @@ class Perception(Node):
             raise ValueError('processing_rate_hz must be positive and <= 15')
         cv2.setNumThreads(1)  # Avoid competing with camera encoding across CPU cores.
         self.bridge = CvBridge()
-        self.tracker = PoseTracker()
         self.buffer = Buffer()
         self.listener = TransformListener(self.buffer, self)
         if p['publish_mount_tf']:
@@ -841,25 +537,12 @@ class Perception(Node):
                     and abs(self.stamp_seconds(candidate_depth.header)-self.stamp_seconds(rgb.header))<=.1
                     and (candidate_depth.width,candidate_depth.height)==(bgr.shape[1],bgr.shape[0])):
                 depth_image=depth_in_meters(self.bridge.imgmsg_to_cv2(candidate_depth,'passthrough'),candidate_depth.encoding)
-            info = self.camera_info
-            region=None
-            if not hasattr(self,'tracker'):
-                self.tracker=PoseTracker()
-            if self.tracker.result is not None and info is not None and info.header.frame_id==rgb.header.frame_id:
-                k=np.asarray(info.k,np.float64).reshape(3,3)
-                if np.isfinite(k).all() and k[0,0]>0 and k[1,1]>0:
-                    region=self.tracker.search_region(k,np.asarray(info.d,np.float64),self.dimensions,
-                                                     self.stamp_seconds(rgb.header),bgr.shape)
             detection = detect_face(bgr, self.values['brown_hsv_low'], self.values['brown_hsv_high'],
-                                    self.values['min_contour_area'], warn=self.warn, depth=depth_image,
-                                    search_region=region)
-            if detection is None and region is not None:
-                detection=detect_face(bgr,self.values['brown_hsv_low'],self.values['brown_hsv_high'],
-                                      self.values['min_contour_area'],warn=self.warn,depth=depth_image)
+                                    self.values['min_contour_area'], warn=self.warn, depth=depth_image)
+            info = self.camera_info
             if self.get_parameter('capture_next_frame').value:
                 self.capture_frame(rgb, bgr, info, detection)
             if detection is None:
-                self.tracker.failures+=1
                 self.marker_pub.publish(MarkerArray(markers=[Marker(
                     ns='detection_rays', id=4, action=Marker.DELETE)]))
                 return
@@ -874,9 +557,15 @@ class Perception(Node):
             # RViz can display these rays; the GUI projects their endpoints to RGB.
             pixels = np.vstack([detection[0], detection[1]])
             xy = cv2.undistortPoints(pixels.reshape(-1, 1, 2), k, np.asarray(info.d, np.float64)).reshape(-1, 2)
-            points = [point for x, y in xy for point in (Point(), Point(x=float(x), y=float(y), z=1.))]
-            rays = make_marker(rgb.header, 'detection_rays', 4, Marker.LINE_LIST,
-                               (.002, 0., 0.), (0., 1., 0., .15), points=points, lifetime=.6)
+            rays = Marker(header=rgb.header, ns='detection_rays', id=4,
+                          type=Marker.LINE_LIST, action=Marker.ADD)
+            rays.pose.orientation.w = 1.
+            rays.scale.x = 0.002
+            rays.color.g, rays.color.a = 1., 0.15
+            rays.lifetime.nanosec = 600000000
+            rays.points = []
+            for x, y in xy:
+                rays.points.extend([Point(), Point(x=float(x), y=float(y), z=1.)])
             self.marker_pub.publish(MarkerArray(markers=[rays]))
             depth = self.latest_depth
             if depth is None or abs(self.stamp_seconds(depth.header)-self.stamp_seconds(rgb.header)) > 0.1:
@@ -950,40 +639,20 @@ class Perception(Node):
             if detection is None:
                 self.warn('No brown rectangular target found; check lighting and brown_hsv_low/high')
                 return
-            # Keep measured perspective edges as the anchor; the fixed-size depth
-            # fit can also recover a pose when four physical corners are unavailable.
-            measurement = estimate_target(bgr, depth, k, distortion, self.dimensions,
+            result = estimate_target(bgr, depth, k, distortion, self.dimensions,
                                      self.values['brown_hsv_low'], self.values['brown_hsv_high'],
                                      self.values['min_contour_area'], self.values['depth_tolerance'],
-                                     self.values['max_reprojection_error'], detection=detection)
-            if not hasattr(self,'tracker'):
-                self.tracker=PoseTracker()
-            stamp=Perception.stamp_seconds(rgb.header)
-            previous=self.tracker.result if self.tracker.stamp is not None and 0<stamp-self.tracker.stamp<1 else None
-            result=fixed_face_fit(bgr,depth,k,distortion,self.dimensions,detection,
-                                  measurement=measurement,previous=previous)
-            if result is None and measurement is not None:
-                result=pose_geometry(measurement['center'],measurement['rotation'],self.dimensions,k,distortion,
-                                     pose_source=measurement.get('pose_source','measured_edges'))
-            appearance=getattr(detection,'appearance',None)
-            if result is not None and appearance is not None:
-                brown_mask,dark_mask,scale=appearance
-                if interior_support(result['corners']*scale,brown_mask,dark_mask) is None:
-                    result=None
+                                     self.values['max_reprojection_error'], detection=detection,
+                                     warn=self.warn)
             if result is None:
-                self.tracker.failures+=1
-                self.warn('Pose rejected: insufficient consistent face depth, appearance and visible boundary support')
-                return
-            result=self.tracker.update(result,stamp,self.dimensions,k,distortion)
-            if result is None:
-                return  # No stale pose is republished while a jump is being checked.
+                return  # RViz markers expire after 0.5 s; no stale pose is republished.
             point = PointStamped(header=rgb.header)
             point.point.x, point.point.y, point.point.z = map(float, result['surface'])
             self.point_camera_pub.publish(point)
             if self.debug_pub.get_subscription_count():
                 cv2.polylines(bgr, [result['corners'].astype(np.int32)], True, (0, 255, 0), 2)
                 u, v = np.rint(result['pixel']).astype(int)
-                cv2.circle(bgr, (u, v), 4, (0, 255, 255), -1)
+                cv2.circle(bgr, (u, v), 4, (0, 0, 255), -1)
                 cv2.putText(bgr, f'center ({u}, {v}) px; depth {result["surface"][2]:.2f}m',
                             (8, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 debug = self.bridge.cv2_to_compressed_imgmsg(bgr)
@@ -1009,22 +678,31 @@ class Perception(Node):
             self.warn(str(error))
 
     def publish_markers(self, point, pose, camera_header, corners_camera, center_camera):
-        contour_points = [Point(x=float(x), y=float(y), z=float(z))
+        sphere = Marker(header=point.header, ns='detected_surface', id=0, type=Marker.SPHERE, action=Marker.ADD)
+        sphere.pose.position = point.point
+        sphere.pose.orientation.w = 1.
+        sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.035
+        sphere.color.g, sphere.color.a = 1., 1.
+        cube = Marker(header=pose.header, ns='box_pose', id=1, type=Marker.CUBE, action=Marker.ADD)
+        cube.pose = pose.pose
+        cube.scale.x, cube.scale.y, cube.scale.z = map(float, self.dimensions)
+        cube.color.b, cube.color.a = 1., 0.35
+        contour = Marker(header=camera_header, ns='detected_contour', id=2,
+                         type=Marker.LINE_STRIP, action=Marker.ADD)
+        contour.pose.orientation.w = 1.
+        contour.scale.x = 0.004
+        contour.color.g, contour.color.a = 1., 1.
+        contour.points = [Point(x=float(x), y=float(y), z=float(z))
                           for x, y, z in np.vstack([corners_camera, corners_camera[:1]])]
-        center = Point(x=float(center_camera[0]), y=float(center_camera[1]), z=float(center_camera[2]))
-        markers = [
-            make_marker(point.header, 'detected_surface', 0, Marker.SPHERE,
-                        (.035, .035, .035), (0., 1., 0., 1.),
-                        pose=Pose(position=point.point, orientation=Quaternion(w=1.))),
-            make_marker(pose.header, 'box_pose', 1, Marker.CUBE,
-                        self.dimensions, (0., 0., 1., .35), pose=pose.pose),
-            make_marker(camera_header, 'detected_contour', 2, Marker.LINE_STRIP,
-                        (.004, 0., 0.), (0., 1., 0., 1.), points=contour_points),
-            make_marker(camera_header, 'box_center_camera', 3, Marker.SPHERE,
-                        (.01, .01, .01), (1., 1., 0., 1.),
-                        pose=Pose(position=center, orientation=Quaternion(w=1.)))
-        ]
-        self.marker_pub.publish(MarkerArray(markers=markers))
+        center = Marker(header=camera_header, ns='box_center_camera', id=3,
+                        type=Marker.SPHERE, action=Marker.ADD)
+        center.pose.position.x, center.pose.position.y, center.pose.position.z = map(float, center_camera)
+        center.pose.orientation.w = 1.
+        center.scale.x = center.scale.y = center.scale.z = 0.01
+        center.color.r, center.color.g, center.color.a = 1., 1., 1.
+        for marker in (sphere, cube, contour, center):
+            marker.lifetime.sec, marker.lifetime.nanosec = 0, 500000000
+        self.marker_pub.publish(MarkerArray(markers=[sphere, cube, contour, center]))
 
 
 def main(args=None):
