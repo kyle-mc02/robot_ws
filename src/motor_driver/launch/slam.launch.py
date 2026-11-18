@@ -88,10 +88,19 @@ def launch_setup(context):
         odometry = {'odom_frame_id': 'odom', 'publish_tf': True,
                     'approx_sync': True, 'approx_sync_max_interval': .1,
                     'topic_queue_size': 5, 'sync_queue_size': 5,
-                    'qos_camera_info': 2, 'Vis/MaxDepth': '4'}
+                    'qos_camera_info': 2, 'Vis/MaxDepth': '4',
+                    # Track features between frames instead of descriptor-only matching.
+                    'Vis/CorType': '1',
+                    # Avoid extrapolating stale motion through abrupt skid-steer turns.
+                    'Odom/GuessMotion': 'false',
+                    # Recover tracking in a new map after prolonged loss.
+                    'Odom/ResetCountdown': '15'}
         # Consume the exact local camera pair used by odometry, with its stamp.
         # Do not synchronize the raw camera streams independently a second time.
-        mapping.update({'approx_sync': False})
+        mapping.update({'approx_sync': False,
+                        # Exclude distant depth speckle and isolated occupied points.
+                        'Grid/RangeMax': '3', 'Grid/NoiseFilteringRadius': '0.10',
+                        'Grid/NoiseFilteringMinNeighbors': '5'})
         executable = 'rgbd_odometry'
     # RTAB-Map core parameters are strings, even when they look numeric.
     def typed(parameters):
