@@ -76,6 +76,7 @@ def launch_setup(context):
                        'Icp/MaxCorrespondenceDistance': '1', 'Icp/RangeMin': '.5',
                        'Icp/RangeMax': '12', 'Icp/CorrespondenceRatio': '.1'})
         odometry = {'odom_frame_id': 'odom', 'publish_tf': True,
+                    'Icp/MaxTranslation': '0.5',  # Allow corrections beyond the 0.2 m default.
                     'expected_update_rate': 15., 'OdomF2M/ScanMaxSize': '15000',
                     'OdomF2M/ScanSubtractRadius': '.10'}
         mapping.update({'RGBD/ProximityBySpace': 'true', 'RGBD/ProximityPathMaxNeighbors': '1',
