@@ -53,7 +53,8 @@ def launch_setup(context):
     common = {'frame_id': 'base_link', 'wait_for_transform': .3,
               'qos': 2, 'Reg/Force3DoF': 'true'}
     mapping = {'database_path': str(database), 'map_frame_id': 'map',
-               'subscribe_depth': sensor == 'rgbd', 'subscribe_rgb': sensor == 'rgbd',
+               'subscribe_depth': False, 'subscribe_rgb': False,
+               'subscribe_rgbd': sensor == 'rgbd',
                'subscribe_scan_cloud': sensor == 'lidar', 'subscribe_odom_info': True,
                'approx_sync': True, 'approx_sync_max_interval': .1,
                'topic_queue_size': 5, 'sync_queue_size': 5,
@@ -88,6 +89,9 @@ def launch_setup(context):
                     'approx_sync': True, 'approx_sync_max_interval': .1,
                     'topic_queue_size': 5, 'sync_queue_size': 5,
                     'qos_camera_info': 2, 'Vis/MaxDepth': '4'}
+        # Consume the exact local camera pair used by odometry, with its stamp.
+        # Do not synchronize the raw camera streams independently a second time.
+        mapping.update({'approx_sync': False})
         executable = 'rgbd_odometry'
     # RTAB-Map core parameters are strings, even when they look numeric.
     def typed(parameters):
@@ -98,7 +102,8 @@ def launch_setup(context):
         Node(package='rtabmap_odom', executable=executable, name=executable,
              namespace='slam', output='screen', parameters=[typed(common), typed(odometry)], remappings=remaps),
         Node(package='rtabmap_slam', executable='rtabmap', name='rtabmap',
-             namespace='slam', output='screen', parameters=[typed(common), typed(mapping)], remappings=remaps)])
+             namespace='slam', output='screen', parameters=[typed(common), typed(mapping)],
+             remappings=remaps + [('rgbd_image', 'odom_rgbd_image')])])
     if value('rviz') == 'true':
         actions.append(viewer)
     return actions
