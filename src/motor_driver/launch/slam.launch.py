@@ -17,6 +17,9 @@ def launch_setup(context):
         return LaunchConfiguration(name).perform(context)
 
     sensor = value('sensor')
+    odometry_sensor = value('odometry_sensor')
+    if odometry_sensor == 'auto':
+        odometry_sensor = sensor
     share = Path(get_package_share_directory('motor_driver'))
     viewer = Node(package='rviz2', executable='rviz2', name='slam_view', output='screen')
     if value('view_only') == 'true':
@@ -30,7 +33,7 @@ def launch_setup(context):
     if value('start_robot') == 'true':
         actions.append(IncludeLaunchDescription(PythonLaunchDescriptionSource(
             str(share/'launch/robot_startup.launch.py'))))
-    if sensor == 'lidar' and value('publish_lidar_tf') == 'true':
+    if odometry_sensor == 'lidar' and value('publish_lidar_tf') == 'true':
         height = float(value('lidar_height'))
         yaw = float(value('lidar_yaw'))
         if not math.isfinite(height) or height <= 0 or not math.isfinite(yaw):
@@ -71,7 +74,7 @@ def launch_setup(context):
               ('rgb/image', '/camera/camera/color/image_raw'),
               ('depth/image', '/camera/camera/aligned_depth_to_color/image_raw'),
               ('rgb/camera_info', '/camera/camera/color/camera_info')]
-    if sensor == 'lidar':
+    if odometry_sensor == 'lidar':
         common.update({'Reg/Strategy': '1', 'Icp/PointToPlane': 'true',
                        'Icp/VoxelSize': '.10', 'Icp/Iterations': '10',
                        'Icp/MaxCorrespondenceDistance': '1', 'Icp/RangeMin': '.5',
@@ -86,7 +89,7 @@ def launch_setup(context):
     else:
         common['Reg/Strategy'] = '0'
         odometry = {'odom_frame_id': 'odom', 'publish_tf': True,
-                    # Reject RGB/depth pairs from different camera frames (30 Hz input).
+                    # Synchronize color and depth camera frames.
                     'approx_sync': True, 'approx_sync_max_interval': .1,
                     'topic_queue_size': 5, 'sync_queue_size': 5,
                     # Keep the laptop's previous odometry processing budget.
@@ -98,8 +101,7 @@ def launch_setup(context):
                     'Vis/CorType': '0', 'Odom/GuessMotion': 'true',
                     # Preserve the current map on tracking loss; never start a new segment automatically.
                     'Odom/ResetCountdown': '0'}
-        # Consume the exact local camera pair used by odometry, with its stamp.
-        # Do not synchronize the raw camera streams independently a second time.
+        # Consume the exact local camera pair used by visual odometry.
         mapping.update({'approx_sync': False,
                         # Exclude distant depth speckle and isolated occupied points.
                         'Grid/RangeMax': '3', 'Grid/NoiseFilteringRadius': '0.10',
@@ -125,6 +127,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('sensor', default_value='lidar', choices=['lidar', 'rgbd'],
                               description='Independent mapping run; never launch both modes together.'),
+        DeclareLaunchArgument('odometry_sensor', default_value='auto', choices=['auto', 'lidar', 'rgbd'],
+                              description='Use LiDAR odometry with RGB-D mapping when visual tracking loses overlap.'),
         DeclareLaunchArgument('start_robot', default_value='false', choices=['true', 'false'],
                               description='Include robot_startup only when it is not already running.'),
         DeclareLaunchArgument('view_only', default_value='false', choices=['true', 'false'],
