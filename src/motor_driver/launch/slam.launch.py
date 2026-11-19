@@ -86,15 +86,16 @@ def launch_setup(context):
     else:
         common['Reg/Strategy'] = '0'
         odometry = {'odom_frame_id': 'odom', 'publish_tf': True,
-                    'approx_sync': True, 'approx_sync_max_interval': .1,
+                    # Reject RGB/depth pairs from different camera frames (30 Hz input).
+                    'approx_sync': True, 'approx_sync_max_interval': .02,
                     'topic_queue_size': 5, 'sync_queue_size': 5,
+                    # Keep the laptop's previous odometry processing budget.
+                    'max_update_rate': 15.,
                     'qos_camera_info': 2, 'Vis/MaxDepth': '4',
-                    # Track features between frames instead of descriptor-only matching.
-                    'Vis/CorType': '1',
-                    # Avoid extrapolating stale motion through abrupt skid-steer turns.
-                    'Odom/GuessMotion': 'false',
-                    # Recover tracking in a new map after prolonged loss.
-                    'Odom/ResetCountdown': '15'}
+                    # Descriptor matching can reacquire landmarks after a blurred frame.
+                    'Vis/CorType': '0', 'Odom/GuessMotion': 'true',
+                    # Preserve the current map on tracking loss; never start a new segment automatically.
+                    'Odom/ResetCountdown': '0'}
         # Consume the exact local camera pair used by odometry, with its stamp.
         # Do not synchronize the raw camera streams independently a second time.
         mapping.update({'approx_sync': False,

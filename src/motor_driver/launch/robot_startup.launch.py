@@ -62,8 +62,10 @@ def generate_launch_description():
                 'enable_accel': 'true',
                 'unite_imu_method': '2',  # Combine gyro and accel on /camera/camera/imu.
                 'align_depth.enable': 'true',
-                'rgb_camera.color_profile': '640x480x15',
-                'depth_module.depth_profile': '640x480x15'
+                # Pair color and depth in the driver before ROS subscription queues.
+                'enable_sync': 'true',
+                'rgb_camera.color_profile': '640x480x30',
+                'depth_module.depth_profile': '640x480x30'
             }.items()
         ),
 
