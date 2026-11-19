@@ -42,7 +42,7 @@ def launch_setup(context):
                                 '--frame-id', 'base_link', '--child-frame-id', value('lidar_frame')]))
 
     if sensor == 'rgbd':
-        # Perception is disabled in robot startup; own only its camera mount TF.
+        # Camera mount relative to the robot base.
         actions.append(Node(package='tf2_ros', executable='static_transform_publisher',
                             name='camera_mount_tf', arguments=[
                                 '--x', '.24', '--y', '-.01', '--z', '.55',
@@ -87,11 +87,13 @@ def launch_setup(context):
         common['Reg/Strategy'] = '0'
         odometry = {'odom_frame_id': 'odom', 'publish_tf': True,
                     # Reject RGB/depth pairs from different camera frames (30 Hz input).
-                    'approx_sync': True, 'approx_sync_max_interval': .02,
+                    'approx_sync': True, 'approx_sync_max_interval': .1,
                     'topic_queue_size': 5, 'sync_queue_size': 5,
                     # Keep the laptop's previous odometry processing budget.
                     'max_update_rate': 15.,
                     'qos_camera_info': 2, 'Vis/MaxDepth': '4',
+                    # Use depth-backed 3D correspondences for camera motion estimation.
+                    'Vis/EstimationType': '0',
                     # Descriptor matching can reacquire landmarks after a blurred frame.
                     'Vis/CorType': '0', 'Odom/GuessMotion': 'true',
                     # Preserve the current map on tracking loss; never start a new segment automatically.
