@@ -272,9 +272,9 @@ class BasestationGUI(QMainWindow):
         control_group = QGroupBox("Auto Navigation")
         control_inner = QVBoxLayout()
         
-        self.start_btn = QPushButton("Start Auto Mission")
+        self.start_btn = QPushButton("Enable Nav2 Commands")
         self.start_btn.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; font-size: 16px; height: 50px;")
-        self.start_btn.clicked.connect(lambda: self.node.send_command('START'))
+        self.start_btn.clicked.connect(lambda: self.node.send_command('NAV2'))
         
         self.estop_btn = QPushButton("E-STOP")
         self.estop_btn.setStyleSheet("background-color: #dc3545; color: white; font-weight: bold; font-size: 20px; height: 60px;")

@@ -38,8 +38,8 @@ def generate_launch_description():
         # Auto Navigation Listener
         Node(
             package='motor_driver',
-            executable='auto_nav',
-            name='auto_nav',
+            executable='command_router',
+            name='command_router',
             output='screen'
         ),
 

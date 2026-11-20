@@ -52,7 +52,7 @@ class JoyToCmdVel(Node):
         self.last_received = None
         self.command = Twist()
 
-        self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.publisher = self.create_publisher(Twist, '/cmd_vel_teleop', 10)
         self.mode = 'ESTOP'
         self.mode_received = float('-inf')
         self.create_subscription(String, '/mission_control', self.mode_callback, 10)
